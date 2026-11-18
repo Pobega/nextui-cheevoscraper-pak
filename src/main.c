@@ -4,7 +4,6 @@
 #include "http_client.h"
 #include "ra_consoles.h"
 #include "rom_hasher.h"
-#include "ui.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -28,6 +27,30 @@
 #define PROGRESS_COMPLETE 100
 #define SETTINGS_STR_MAX 256
 #define INITIAL_LIST_CAP 64
+
+typedef struct {
+	const char* userdata_dir;
+	const char* roms_dir;
+	const char* fifo_path;
+	int delay_ms;
+	int limit;
+	bool dry_run;
+	bool force;
+	bool refresh_sessions;
+} SyncOptions;
+
+typedef struct {
+	size_t roms_scanned;
+	size_t index_hits;
+	size_t roms_hashed;
+	size_t hash_failures;
+	size_t unique_games;
+	size_t sets_fetched;
+	size_t sets_cached;
+	size_t sessions_fetched;
+	size_t badges_downloaded;
+	size_t errors;
+} RunStats;
 
 typedef struct {
 	char username[SETTINGS_STR_MAX];
@@ -615,34 +638,75 @@ static void download_badge_variant(const SyncOptions* opts, HttpClient* http,
 	}
 }
 
-static void emit_progress(SyncProgressFn progress_cb, void* cb_userdata,
-                          const char* phase, const char* item_name,
-                          size_t current, size_t total, const RunStats* stats) {
-	if (!progress_cb) {
+static bool has_suffix(const char* name, const char* suffix) {
+	size_t nlen = strlen(name);
+	size_t slen = strlen(suffix);
+	return nlen > slen && strcmp(name + nlen - slen, suffix) == 0;
+}
+
+static void count_ra_dir(const char* dir_path, size_t* out_games, size_t* out_badges) {
+	DIR* dir = opendir(dir_path);
+	if (!dir) {
 		return;
 	}
-	SyncProgress p = {
-		.phase = phase,
-		.item_name = item_name,
-		.current = current,
-		.total = total,
-		.stats = stats
-	};
-	progress_cb(&p, cb_userdata);
+
+	struct dirent* ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.') {
+			continue;
+		}
+
+		char full_path[CACHE_MAX_PATH];
+		if (snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name) >= (int)sizeof(full_path)) {
+			continue;
+		}
+
+		struct stat st;
+		if (stat(full_path, &st) != 0) {
+			continue;
+		}
+
+		if (S_ISDIR(st.st_mode)) {
+			count_ra_dir(full_path, out_games, out_badges);
+		} else if (S_ISREG(st.st_mode)) {
+			if (strncmp(ent->d_name, "achievementsets_", 16) == 0 &&
+			    has_suffix(ent->d_name, ".bin")) {
+				(*out_games)++;
+			} else if (has_suffix(ent->d_name, ".png")) {
+				(*out_badges)++;
+			}
+		}
+	}
+
+	closedir(dir);
+}
+
+static int print_status(const SyncOptions* opts) {
+	RASettings settings;
+	bool loaded = load_ra_settings(opts->userdata_dir, &settings);
+	const char* username = effective_username(&settings);
+	if (!loaded || !*username || !*settings.token) {
+		printf("Not logged in (configure RA in NextUI Settings)\n");
+		return 2;
+	}
+
+	char ra_dir[CACHE_MAX_PATH];
+	size_t games = 0;
+	size_t badges = 0;
+	if (snprintf(ra_dir, sizeof(ra_dir), "%s/.ra", opts->userdata_dir) < (int)sizeof(ra_dir)) {
+		count_ra_dir(ra_dir, &games, &badges);
+	}
+
+	printf("User: %s | Cached: %zu games, %zu badges\n", username, games, badges);
+	return 0;
 }
 
 static void cache_game_badges(const SyncOptions* opts, HttpClient* http,
                               const rc_api_fetch_game_sets_response_t* sets,
-                              StringSet* seen_badges, RunStats* stats,
-                              SyncProgressFn progress_cb, void* cb_userdata,
-                              bool* cancel_requested, size_t game_cur, size_t game_tot,
-                              const char* game_name) {
+                              StringSet* seen_badges, RunStats* stats) {
 	for (uint32_t s = 0; s < sets->num_sets; s++) {
 		const rc_api_achievement_set_definition_t* set = &sets->sets[s];
 		for (uint32_t a = 0; a < set->num_achievements; a++) {
-			if (cancel_requested && *cancel_requested) {
-				return;
-			}
 			const char* badge = set->achievements[a].badge_name;
 			if (!badge || !*badge) {
 				continue;
@@ -652,15 +716,13 @@ static void cache_game_badges(const SyncOptions* opts, HttpClient* http,
 			}
 			download_badge_variant(opts, http, badge, false, stats);
 			download_badge_variant(opts, http, badge, true, stats);
-			emit_progress(progress_cb, cb_userdata, "Caching Game Sets & Badges",
-			              game_name, game_cur, game_tot, stats);
 		}
 	}
 }
 
 static void print_usage(const char* prog) {
 	printf("Usage: %s [options]\n"
-	       "  --ui                 Launch native SDL2 graphical interface\n"
+	       "  --status             Print RA login and cache status (exit 2 if not logged in)\n"
 	       "  --userdata <dir>     Shared userdata dir (default: $SHARED_USERDATA_PATH or %s)\n"
 	       "  --roms <dir>         ROMs root dir (default: $SDCARD_PATH/Roms or %s)\n"
 	       "  --fifo <path>        FIFO path for show2.elf TEXT/PROGRESS updates\n"
@@ -673,7 +735,7 @@ static void print_usage(const char* prog) {
 	       prog, DEFAULT_USERDATA_PATH, DEFAULT_ROMS_PATH, HTTP_DEFAULT_DELAY_MS);
 }
 
-static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* use_ui,
+static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mode,
                        char* default_roms_buf, size_t roms_buf_sz) {
 	const char* env_userdata = getenv("SHARED_USERDATA_PATH");
 	const char* env_sdcard = getenv("SDCARD_PATH");
@@ -691,11 +753,11 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* use_ui,
 	opts->dry_run = false;
 	opts->force = false;
 	opts->refresh_sessions = false;
-	*use_ui = false;
+	*status_mode = false;
 
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--ui") == 0) {
-			*use_ui = true;
+		if (strcmp(argv[i], "--status") == 0) {
+			*status_mode = true;
 		} else if (strcmp(argv[i], "--userdata") == 0 && i + 1 < argc) {
 			opts->userdata_dir = argv[++i];
 		} else if (strcmp(argv[i], "--roms") == 0 && i + 1 < argc) {
@@ -724,30 +786,23 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* use_ui,
 	return true;
 }
 
-static bool run_sync(const SyncOptions* opts, SyncProgressFn progress_cb,
-                     void* cb_userdata, bool* cancel_requested, RunStats* out_stats) {
+static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 	memset(out_stats, 0, sizeof(*out_stats));
 
 	RASettings settings;
 	if (!load_ra_settings(opts->userdata_dir, &settings)) {
-		snprintf(out_stats->error_message, sizeof(out_stats->error_message),
-		         "Missing NextUI settings file");
-		ui_status(opts, -1, "%s", out_stats->error_message);
+		ui_status(opts, -1, "Missing NextUI settings file");
 		return false;
 	}
 
 	const char* username = effective_username(&settings);
 	if (!*username || !*settings.token) {
-		snprintf(out_stats->error_message, sizeof(out_stats->error_message),
-		         "Not logged in — configure RA in NextUI Settings");
 		ui_status(opts, -1, "No RetroAchievements login in NextUI settings");
 		return false;
 	}
 
 	if (!opts->dry_run && !ensure_cache_dirs(opts->userdata_dir)) {
-		snprintf(out_stats->error_message, sizeof(out_stats->error_message),
-		         "Failed to create .ra cache directories");
-		ui_status(opts, -1, "%s", out_stats->error_message);
+		ui_status(opts, -1, "Failed to create .ra cache directories");
 		return false;
 	}
 
@@ -755,21 +810,12 @@ static bool run_sync(const SyncOptions* opts, SyncProgressFn progress_cb,
 	http_client_init(&http, opts->delay_ms);
 
 	ui_status(opts, 0, "Verifying RetroAchievements login...");
-	emit_progress(progress_cb, cb_userdata, "Verifying Login", username, 0, 1, out_stats);
 	if (!perform_login(opts, &http, username, settings.token)) {
-		snprintf(out_stats->error_message, sizeof(out_stats->error_message),
-		         "RetroAchievements login failed");
-		ui_status(opts, -1, "%s", out_stats->error_message);
+		ui_status(opts, -1, "RetroAchievements login failed");
 		return false;
-	}
-	if (cancel_requested && *cancel_requested) {
-		out_stats->cancelled = true;
-		return true;
 	}
 
 	ui_status(opts, 5, "Scanning ROM folders...");
-	emit_progress(progress_cb, cb_userdata, "Scanning ROM Folders",
-	              "Discovering ROMs...", 0, 1, out_stats);
 	RomList roms = {0};
 	collect_roms(opts->roms_dir, opts->limit, &roms);
 
@@ -785,19 +831,11 @@ static bool run_sync(const SyncOptions* opts, SyncProgressFn progress_cb,
 
 	HashSet unique_hashes = {0};
 	for (size_t i = 0; i < roms.count; i++) {
-		if (cancel_requested && *cancel_requested) {
-			out_stats->cancelled = true;
-			break;
-		}
-
 		RomEntry* rom = &roms.items[i];
 		const char* rom_name = basename_ptr(rom->rel_path);
 		int pct = roms.count > 0
 			? 5 + (int)(((i + 1) * (PROGRESS_SCAN_MAX - 5)) / roms.count)
 			: PROGRESS_SCAN_MAX;
-
-		emit_progress(progress_cb, cb_userdata, "Hashing ROMs",
-		              rom_name, i + 1, roms.count, out_stats);
 
 		const char* cached_hash = opts->force ? NULL
 			: scraper_index_lookup(&index, rom->rel_path, rom->console_id, rom->mtime, rom->size);
@@ -828,66 +866,47 @@ static bool run_sync(const SyncOptions* opts, SyncProgressFn progress_cb,
 	out_stats->unique_games = unique_hashes.count;
 	StringSet seen_badges = {0};
 
-	if (!out_stats->cancelled) {
-		for (size_t i = 0; i < unique_hashes.count; i++) {
-			if (cancel_requested && *cancel_requested) {
-				out_stats->cancelled = true;
-				break;
-			}
+	for (size_t i = 0; i < unique_hashes.count; i++) {
+		const char* hash = unique_hashes.hashes[i];
+		const char* name = unique_hashes.sample_names[i];
+		int pct = PROGRESS_SCAN_MAX +
+			(int)(((i + 1) * (PROGRESS_COMPLETE - PROGRESS_SCAN_MAX)) / unique_hashes.count);
 
-			const char* hash = unique_hashes.hashes[i];
-			const char* name = unique_hashes.sample_names[i];
-			int pct = PROGRESS_SCAN_MAX +
-				(int)(((i + 1) * (PROGRESS_COMPLETE - PROGRESS_SCAN_MAX)) / unique_hashes.count);
+		ui_status(opts, pct, "Caching (%zu/%zu): %s", i + 1, unique_hashes.count, name);
 
-			ui_status(opts, pct, "Caching (%zu/%zu): %s", i + 1, unique_hashes.count, name);
-			emit_progress(progress_cb, cb_userdata, "Caching Game Sets & Badges",
-			              name, i + 1, unique_hashes.count, out_stats);
-
-			rc_api_fetch_game_sets_response_t sets;
-			if (!fetch_or_load_game_sets(opts, &http, username, settings.token, hash, &sets, out_stats)) {
-				continue;
-			}
-
-			if (sets.id != 0) {
-				if (cancel_requested && *cancel_requested) {
-					rc_api_destroy_fetch_game_sets_response(&sets);
-					out_stats->cancelled = true;
-					break;
-				}
-				uint32_t session_gid = sets.session_game_id ? sets.session_game_id : sets.id;
-				cache_startsession(opts, &http, username, settings.token,
-				                   settings.hardcore, session_gid, hash, out_stats);
-				cache_game_badges(opts, &http, &sets, &seen_badges, out_stats,
-				                  progress_cb, cb_userdata, cancel_requested,
-				                  i + 1, unique_hashes.count, name);
-			}
-
-			rc_api_destroy_fetch_game_sets_response(&sets);
-			if (cancel_requested && *cancel_requested) {
-				out_stats->cancelled = true;
-				break;
-			}
+		rc_api_fetch_game_sets_response_t sets;
+		if (!fetch_or_load_game_sets(opts, &http, username, settings.token, hash, &sets, out_stats)) {
+			continue;
 		}
+
+		if (sets.id != 0) {
+			uint32_t session_gid = sets.session_game_id ? sets.session_game_id : sets.id;
+			cache_startsession(opts, &http, username, settings.token,
+			                   settings.hardcore, session_gid, hash, out_stats);
+			cache_game_badges(opts, &http, &sets, &seen_badges, out_stats);
+		}
+
+		rc_api_destroy_fetch_game_sets_response(&sets);
 	}
 
 	string_set_free(&seen_badges);
 	hash_set_free(&unique_hashes);
 
-	if (out_stats->cancelled) {
-		ui_status(opts, -1, "Sync cancelled by user");
-	} else {
-		ui_status(opts, PROGRESS_COMPLETE,
-		          "Done! %zu games (%zu fetched, %zu cached), %zu badges, %zu errors",
-		          out_stats->unique_games, out_stats->sets_fetched, out_stats->sets_cached,
-		          out_stats->badges_downloaded, out_stats->errors);
-	}
+	ui_status(opts, PROGRESS_COMPLETE,
+	          "Done! %zu games (%zu fetched, %zu cached), %zu badges, %zu errors",
+	          out_stats->unique_games, out_stats->sets_fetched, out_stats->sets_cached,
+	          out_stats->badges_downloaded, out_stats->errors);
 
 	printf("Summary: scanned=%zu index_hits=%zu hashed=%zu hash_fail=%zu unique=%zu "
 	       "sets_fetched=%zu sets_cached=%zu sessions=%zu badges=%zu errors=%zu\n",
 	       out_stats->roms_scanned, out_stats->index_hits, out_stats->roms_hashed, out_stats->hash_failures,
 	       out_stats->unique_games, out_stats->sets_fetched, out_stats->sets_cached,
 	       out_stats->sessions_fetched, out_stats->badges_downloaded, out_stats->errors);
+	printf("SUMMARY: Scanned %zu | Matched %zu | Cached %zu | Badges %zu | Errors %zu\n",
+	       out_stats->roms_scanned, out_stats->unique_games,
+	       out_stats->sets_fetched + out_stats->sets_cached,
+	       out_stats->badges_downloaded, out_stats->errors);
+	fflush(stdout);
 
 	return true;
 }
@@ -895,21 +914,17 @@ static bool run_sync(const SyncOptions* opts, SyncProgressFn progress_cb,
 int main(int argc, char** argv) {
 	char default_roms_buf[CACHE_MAX_PATH];
 	SyncOptions opts;
-	bool use_ui = false;
-	if (!parse_args(argc, argv, &opts, &use_ui, default_roms_buf, sizeof(default_roms_buf))) {
+	bool status_mode = false;
+	if (!parse_args(argc, argv, &opts, &status_mode, default_roms_buf, sizeof(default_roms_buf))) {
 		return 1;
 	}
 
-	if (use_ui) {
-		RASettings settings = {0};
-		(void)load_ra_settings(opts.userdata_dir, &settings);
-		const char* username = effective_username(&settings);
-		bool logged_in = (*username != '\0' && settings.token[0] != '\0');
-		return ui_run(&opts, username, logged_in, run_sync);
+	if (status_mode) {
+		return print_status(&opts);
 	}
 
 	RunStats stats;
-	bool ok = run_sync(&opts, NULL, NULL, NULL, &stats);
+	bool ok = run_sync(&opts, &stats);
 	fifo_close();
 	return ok ? 0 : 1;
 }
