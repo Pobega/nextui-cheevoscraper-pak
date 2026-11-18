@@ -117,16 +117,22 @@ run_sync_with_ui() {
 		*" --force "*)            INIT_MSG="Rebuilding cache..." ;;
 	esac
 
-	if command -v show2.elf >/dev/null 2>&1; then
+	if command -v show2.elf >/dev/null 2>&1 && [ -f "$PAK_DIR/res/blank.png" ]; then
 		rm -f "$FIFO_PATH"
-		show2.elf --mode=daemon --text="$INIT_MSG" --progress=0 >/dev/null 2>&1 &
+		show2.elf --mode=daemon --image="$PAK_DIR/res/blank.png" --text="$INIT_MSG" --progress=0 >/dev/null 2>&1 &
 		SHOW2_PID=$!
 		wait_i=0
 		while [ ! -p "$FIFO_PATH" ] && [ "$wait_i" -lt 20 ]; do
+			if ! kill -0 "$SHOW2_PID" 2>/dev/null; then
+				SHOW2_PID=""
+				break
+			fi
 			usleep 100000 2>/dev/null || sleep 1
 			wait_i=$((wait_i + 1))
 		done
-	else
+	fi
+	if [ -z "$SHOW2_PID" ] || ! kill -0 "$SHOW2_PID" 2>/dev/null; then
+		SHOW2_PID=""
 		minui-presenter --message "$INIT_MSG" --timeout -1 >/dev/null 2>&1 &
 		PRESENTER_PID=$!
 	fi

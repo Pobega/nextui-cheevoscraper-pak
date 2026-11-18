@@ -212,8 +212,9 @@ $(foreach p,$(PLATFORMS),$(eval $(call BUILD_PLATFORM_RULE,$(p))))
 package:
 	@echo "Packaging $(PAK_NAME).pak..."
 	@rm -rf $(BUILD_DIR)/staging $(DIST_DIR)
-	@mkdir -p $(BUILD_DIR)/staging/bin $(DIST_DIR)
+	@mkdir -p $(BUILD_DIR)/staging/bin $(BUILD_DIR)/staging/res $(DIST_DIR)
 	@cp pak.json launch.sh README.md $(BUILD_DIR)/staging/
+	@cp res/blank.png $(BUILD_DIR)/staging/res/
 	@chmod 0755 $(BUILD_DIR)/staging/launch.sh
 	@for p in $(PLATFORMS); do \
 		for b in ra-cache minui-list minui-presenter; do \
@@ -223,8 +224,9 @@ package:
 		done; \
 		mkdir -p "$(BUILD_DIR)/staging/bin/$$p"; \
 		cp "$(BUILD_DIR)/bin/$$p/ra-cache" "$(BUILD_DIR)/bin/$$p/minui-list" "$(BUILD_DIR)/bin/$$p/minui-presenter" "$(BUILD_DIR)/staging/bin/$$p/"; \
-		mkdir -p "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/bin/$$p"; \
+		mkdir -p "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/bin/$$p" "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/res"; \
 		cp pak.json launch.sh README.md "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/"; \
+		cp res/blank.png "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/res/"; \
 		chmod 0755 "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/launch.sh"; \
 		cp "$(BUILD_DIR)/bin/$$p/ra-cache" "$(BUILD_DIR)/bin/$$p/minui-list" "$(BUILD_DIR)/bin/$$p/minui-presenter" "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/bin/$$p/"; \
 	done
