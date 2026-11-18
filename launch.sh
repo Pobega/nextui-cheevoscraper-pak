@@ -147,14 +147,19 @@ system_menu() {
 			return
 		fi
 
-		: > "$SYS_MENU_FILE"
+		printf '[' > "$SYS_MENU_FILE"
+		first_sys=1
 		while IFS="$TAB" read -r s_folder s_tag s_count; do
 			[ -n "$s_folder" ] || continue
-			printf '%s (%s ROMs)\n' "$s_folder" "$s_count" >> "$SYS_MENU_FILE"
+			esc_folder="$(printf '%s' "$s_folder" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+			[ "$first_sys" -eq 0 ] && printf ',' >> "$SYS_MENU_FILE"
+			printf '"%s (%s ROMs)"' "$esc_folder" "$s_count" >> "$SYS_MENU_FILE"
+			first_sys=0
 		done < "$SYS_LIST_TSV"
+		printf ']\n' >> "$SYS_MENU_FILE"
 
 		rm -f "$SYS_OUT_FILE"
-		minui-list --disable-auto-sleep --file "$SYS_MENU_FILE" --format text --title "Sync by System" --confirm-text "SELECT" --write-location "$SYS_OUT_FILE" >/dev/null
+		minui-list --disable-auto-sleep --file "$SYS_MENU_FILE" --format json --title "Sync by System" --confirm-text "SELECT" --write-location "$SYS_OUT_FILE" >/dev/null
 		RC=$?
 		if [ "$RC" -ne 0 ] || [ ! -f "$SYS_OUT_FILE" ]; then
 			return
@@ -177,13 +182,10 @@ system_menu() {
 
 		while true; do
 			cat << EOF > "$ACT_MENU_FILE"
-Sync Uncached in $SYS_TAG
-Sync All in $SYS_TAG
-Select Games Manually...
-Back
+["Sync Uncached in $SYS_TAG","Sync All in $SYS_TAG","Select Games Manually...","Back"]
 EOF
 			rm -f "$ACT_OUT_FILE"
-			minui-list --disable-auto-sleep --file "$ACT_MENU_FILE" --format text --title "$SYS_FOLDER" --confirm-text "SELECT" --write-location "$ACT_OUT_FILE" >/dev/null
+			minui-list --disable-auto-sleep --file "$ACT_MENU_FILE" --format json --title "$SYS_FOLDER" --confirm-text "SELECT" --write-location "$ACT_OUT_FILE" >/dev/null
 			RC=$?
 			if [ "$RC" -ne 0 ] || [ ! -f "$ACT_OUT_FILE" ]; then
 				break
@@ -285,20 +287,13 @@ fi
 load_settings
 
 cat << 'EOF' > "$MENU_FILE"
-Sync New Games
-Sync by System...
-Refresh Sessions
-Force Rebuild Cache
-Re-check Unrecognized
-Cache Info
-Settings
-Exit
+["Sync New Games","Sync by System...","Refresh Sessions","Force Rebuild Cache","Re-check Unrecognized","Cache Info","Settings","Exit"]
 EOF
 
 while true; do
 	STATUS_LINE="$("$BIN" --status)" || break
 	rm -f "$OUT_FILE"
-	minui-list --disable-auto-sleep --file "$MENU_FILE" --format text --title "$STATUS_LINE" --confirm-text "SELECT" --write-location "$OUT_FILE" >/dev/null
+	minui-list --disable-auto-sleep --file "$MENU_FILE" --format json --title "$STATUS_LINE" --confirm-text "SELECT" --write-location "$OUT_FILE" >/dev/null
 	RC=$?
 	if [ "$RC" -ne 0 ] || [ ! -f "$OUT_FILE" ]; then
 		echo "minui-list main menu exited with code $RC" >&2

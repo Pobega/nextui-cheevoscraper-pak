@@ -400,13 +400,19 @@ static void test_ra_format_display_name(void) {
 	char buf[64];
 
 	ra_format_display_name("Super Mario World (USA).sfc", buf, sizeof(buf), 24);
-	ASSERT_EQ_STR("Super Mario World (USA)", buf);
+	ASSERT_EQ_STR("Super Mario World", buf);
 
-	ra_format_display_name("Mario/Super Mario World (USA) (Rev 1).zip", buf, sizeof(buf), 24);
-	ASSERT_EQ_STR("Mario/Super Mario Wor...", buf);
+	ra_format_display_name("Capcom Play System 2/Super Street Fighter II (USA) (Rev 1).zip", buf, sizeof(buf), 24);
+	ASSERT_EQ_STR("Super Street Fighter II", buf);
+
+	ra_format_display_name("Mario/Super Mario World Very Long Subtitle (USA) [!].zip", buf, sizeof(buf), 24);
+	ASSERT_EQ_STR("Super Mario World Ver...", buf);
 
 	ra_format_display_name("Short.gb", buf, sizeof(buf), 24);
 	ASSERT_EQ_STR("Short", buf);
+
+	ra_format_display_name("(Demo).gb", buf, sizeof(buf), 24);
+	ASSERT_EQ_STR("(Demo)", buf);
 
 	ra_format_display_name("", buf, sizeof(buf), 24);
 	ASSERT_EQ_STR("", buf);
