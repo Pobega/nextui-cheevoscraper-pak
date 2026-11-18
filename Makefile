@@ -1,6 +1,9 @@
 PAK_NAME ?= RA Cache
 PLATFORMS ?= tg5040 h700
 
+PUSH_PLATFORM ?= tg5040
+PUSH_SDCARD_PATH ?= /mnt/SDCARD
+
 RCHEEVOS_REPO ?= https://github.com/RetroAchievements/rcheevos.git
 RCHEEVOS_COMMIT ?= 40d916de00fe757bab40fb4db41a7912193a48e3
 
@@ -74,7 +77,7 @@ RCHEEVOS_CFLAGS := $(TARGET_OPT) -std=gnu99 -I$(RCHEEVOS_INCDIR) -I$(RCHEEVOS_SR
 APP_CFLAGS := $(TARGET_OPT) -std=gnu99 -Wall -Wextra -Werror -I$(RCHEEVOS_INCDIR) -I$(CURDIR)/src
 APP_LDFLAGS := -lcrypto -lzip -lpthread -lm
 
-.PHONY: all rcheevos host internal-build build package clean distclean $(foreach p,$(PLATFORMS),build-$(p))
+.PHONY: all rcheevos host internal-build build package push deploy clean distclean $(foreach p,$(PLATFORMS),build-$(p))
 
 all: build package
 
@@ -176,6 +179,14 @@ package:
 	done
 	@cd $(BUILD_DIR)/staging && zip -r "$(DIST_DIR)/$(PAK_NAME).pak.zip" .
 	@echo "Created $(DIST_DIR)/$(PAK_NAME).pak.zip"
+
+push: all
+	@if ! command -v adb >/dev/null 2>&1; then \
+		echo "Error: adb not found in PATH"; exit 1; \
+	fi
+	adb push "$(DIST_DIR)/Tools/$(PUSH_PLATFORM)/$(PAK_NAME).pak/." "$(PUSH_SDCARD_PATH)/Tools/$(PUSH_PLATFORM)/$(PAK_NAME).pak"
+
+deploy: push
 
 clean:
 	rm -rf $(BUILD_DIR)/host $(BUILD_DIR)/tg5040 $(BUILD_DIR)/h700 $(BUILD_DIR)/bin $(BUILD_DIR)/staging $(DIST_DIR)
