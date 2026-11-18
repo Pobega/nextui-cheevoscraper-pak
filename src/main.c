@@ -4,6 +4,7 @@
 #include "http_client.h"
 #include "ra_consoles.h"
 #include "rom_hasher.h"
+#include "sync_opts.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -38,6 +39,8 @@ typedef struct {
 	const char* sync_json_path;
 	int delay_ms;
 	int limit;
+	BadgeMode badge_mode;
+	bool skip_disc_systems;
 	bool dry_run;
 	bool force;
 	bool refresh_sessions;
@@ -331,12 +334,16 @@ static bool resolve_system_folder(const char* roms_dir, const char* folder_name,
 	return true;
 }
 
-static bool collect_roms(const char* roms_dir, const char* system_folder, int limit, RomList* list) {
+static bool collect_roms(const char* roms_dir, const char* system_folder, bool skip_disc_systems,
+                         int limit, RomList* list) {
 	if (system_folder && *system_folder) {
 		char folder_path[CACHE_MAX_PATH];
 		int console_id = RC_CONSOLE_UNKNOWN;
 		if (!resolve_system_folder(roms_dir, system_folder, folder_path, sizeof(folder_path), &console_id)) {
 			return false;
+		}
+		if (skip_disc_systems && ra_is_disc_console(console_id)) {
+			return true;
 		}
 		walk_console_dir(folder_path, system_folder, console_id, limit, list, NULL);
 		return true;
@@ -371,6 +378,9 @@ static bool collect_roms(const char* roms_dir, const char* system_folder, int li
 		ra_extract_emu_tag(ent->d_name, emu_tag, sizeof(emu_tag));
 		int console_id = ra_get_console_id(emu_tag);
 		if (console_id == RC_CONSOLE_UNKNOWN) {
+			continue;
+		}
+		if (skip_disc_systems && ra_is_disc_console(console_id)) {
 			continue;
 		}
 
@@ -751,6 +761,9 @@ static int print_status(const SyncOptions* opts) {
 static void cache_game_badges(const SyncOptions* opts, HttpClient* http,
                               const rc_api_fetch_game_sets_response_t* sets,
                               StringSet* seen_badges, RunStats* stats) {
+	if (opts->badge_mode == BADGE_MODE_NONE) {
+		return;
+	}
 	for (uint32_t s = 0; s < sets->num_sets; s++) {
 		const rc_api_achievement_set_definition_t* set = &sets->sets[s];
 		for (uint32_t a = 0; a < set->num_achievements; a++) {
@@ -762,7 +775,9 @@ static void cache_game_badges(const SyncOptions* opts, HttpClient* http,
 				continue;
 			}
 			download_badge_variant(opts, http, badge, false, stats);
-			download_badge_variant(opts, http, badge, true, stats);
+			if (opts->badge_mode == BADGE_MODE_ALL) {
+				download_badge_variant(opts, http, badge, true, stats);
+			}
 		}
 	}
 }
@@ -838,6 +853,9 @@ static int list_systems(const SyncOptions* opts) {
 		ra_extract_emu_tag(ent->d_name, emu_tag, sizeof(emu_tag));
 		int console_id = ra_get_console_id(emu_tag);
 		if (console_id == RC_CONSOLE_UNKNOWN) {
+			continue;
+		}
+		if (opts->skip_disc_systems && ra_is_disc_console(console_id)) {
 			continue;
 		}
 
@@ -1173,7 +1191,9 @@ static bool json_skip_value(const char** p) {
 	return true;
 }
 
-static bool json_parse_game_object(const char** p, StringSet* out_names) {
+typedef void (*JsonItemCallback)(const char* name, long selected_idx, void* ctx);
+
+static bool json_parse_item_object(const char** p, JsonItemCallback cb, void* ctx) {
 	json_skip_ws(p);
 	if (**p != '{') {
 		return false;
@@ -1186,7 +1206,7 @@ static bool json_parse_game_object(const char** p, StringSet* out_names) {
 	}
 
 	char* name = NULL;
-	bool selected = false;
+	long selected = 0;
 
 	while (**p != '\0') {
 		json_skip_ws(p);
@@ -1214,12 +1234,14 @@ static bool json_parse_game_object(const char** p, StringSet* out_names) {
 		} else if (strcmp(key, "selected") == 0) {
 			if (**p == '-' || isdigit((unsigned char)**p)) {
 				char* end = NULL;
-				long val = strtol(*p, &end, 10);
+				selected = strtol(*p, &end, 10);
 				*p = end;
-				selected = (val == 1);
 			} else if (strncmp(*p, "true", 4) == 0) {
 				*p += 4;
-				selected = true;
+				selected = 1;
+			} else if (strncmp(*p, "false", 5) == 0) {
+				*p += 5;
+				selected = 0;
 			} else if (!json_skip_value(p)) {
 				free(key);
 				free(name);
@@ -1237,8 +1259,8 @@ static bool json_parse_game_object(const char** p, StringSet* out_names) {
 			(*p)++;
 		} else if (**p == '}') {
 			(*p)++;
-			if (selected && name && *name) {
-				string_set_insert(out_names, name);
+			if (name && *name) {
+				cb(name, selected, ctx);
 			}
 			free(name);
 			return true;
@@ -1252,7 +1274,8 @@ static bool json_parse_game_object(const char** p, StringSet* out_names) {
 	return false;
 }
 
-static bool parse_selected_games_json(const char* json_path, StringSet* out_names) {
+static bool parse_minui_list_json(const char* json_path, const char* item_key,
+                                  JsonItemCallback cb, void* ctx) {
 	FILE* f = fopen(json_path, "rb");
 	if (!f) {
 		fprintf(stderr, "Error: cannot open JSON file %s: %s\n", json_path, strerror(errno));
@@ -1308,12 +1331,12 @@ static bool parse_selected_games_json(const char* json_path, StringSet* out_name
 		p++;
 		json_skip_ws(&p);
 
-		if (strcmp(key, "games") == 0 && *p == '[') {
+		if (strcmp(key, item_key) == 0 && *p == '[') {
 			p++;
 			json_skip_ws(&p);
 			if (*p != ']') {
 				while (*p != '\0') {
-					if (!json_parse_game_object(&p, out_names)) {
+					if (!json_parse_item_object(&p, cb, ctx)) {
 						ok = false;
 						break;
 					}
@@ -1353,6 +1376,49 @@ static bool parse_selected_games_json(const char* json_path, StringSet* out_name
 
 	free(buf);
 	return ok;
+}
+
+static void on_game_json_item(const char* name, long selected, void* ctx) {
+	if (selected == 1) {
+		string_set_insert((StringSet*)ctx, name);
+	}
+}
+
+static bool parse_selected_games_json(const char* json_path, StringSet* out_names) {
+	return parse_minui_list_json(json_path, "games", on_game_json_item, out_names);
+}
+
+typedef struct {
+	const char* badges;
+	int skip_disc;
+} ParsedSettings;
+
+static void on_settings_json_item(const char* name, long selected, void* ctx) {
+	ParsedSettings* s = (ParsedSettings*)ctx;
+	if (strcmp(name, "Download Badges") == 0) {
+		if (selected == 1) {
+			s->badges = "unlocked";
+		} else if (selected == 2) {
+			s->badges = "none";
+		} else {
+			s->badges = "all";
+		}
+	} else if (strcmp(name, "Skip Disc Systems") == 0) {
+		s->skip_disc = (selected == 1) ? 1 : 0;
+	}
+}
+
+static int parse_settings_json_cmd(const char* json_path) {
+	ParsedSettings parsed = {
+		.badges = "all",
+		.skip_disc = 0
+	};
+	if (!parse_minui_list_json(json_path, "settings", on_settings_json_item, &parsed)) {
+		fprintf(stderr, "Error: failed to parse settings JSON from %s\n", json_path);
+		return 1;
+	}
+	printf("BADGES=%s\nSKIP_DISC=%d\n", parsed.badges, parsed.skip_disc);
+	return 0;
 }
 
 static bool collect_roms_from_json(const SyncOptions* opts, RomList* list, bool* out_empty) {
@@ -1522,28 +1588,31 @@ static void normalize_folder_arg(const char* src, char* dst, size_t dst_sz) {
 
 static void print_usage(const char* prog) {
 	printf("Usage: %s [options]\n"
-	       "  --status                   Print RA login and cache status (exit 2 if not logged in)\n"
-	       "  --list-systems             List supported ROM folders (<folder>\\t<tag>\\t<count>)\n"
-	       "  --list-games-json <dir>    Print minui-list JSON for ROMs in <dir>\n"
-	       "  --clear-unrecognized       Remove cached achievementsets for unrecognized games\n"
-	       "  --cache-info               Print detailed cache statistics\n"
-	       "  --system <dir>             Limit sync to a single ROM folder under --roms\n"
-	       "  --sync-json <path>         Sync only games with selected=1 in <path> (requires --system)\n"
-	       "  --userdata <dir>           Shared userdata dir (default: $SHARED_USERDATA_PATH or %s)\n"
-	       "  --roms <dir>               ROMs root dir (default: $SDCARD_PATH/Roms or %s)\n"
-	       "  --fifo <path>              FIFO path for show2.elf TEXT/PROGRESS updates\n"
-	       "  --delay-ms <ms>            Delay between HTTP requests (default: %d)\n"
-	       "  --limit <n>                Maximum ROMs to scan\n"
-	       "  --dry-run                  Scan and hash only; do not write cache or hit network\n"
-	       "  --force                    Re-hash ROMs and re-fetch existing cache files\n"
-	       "  --refresh-sessions         Re-fetch startsession cache files for all matched games\n"
-	       "  --help                     Show this help message\n",
+	       "  --status                      Print RA login and cache status (exit 2 if not logged in)\n"
+	       "  --list-systems                List supported ROM folders (<folder>\\t<tag>\\t<count>)\n"
+	       "  --list-games-json <dir>       Print minui-list JSON for ROMs in <dir>\n"
+	       "  --clear-unrecognized          Remove cached achievementsets for unrecognized games\n"
+	       "  --cache-info                  Print detailed cache statistics\n"
+	       "  --parse-settings-json <path>  Parse minui-list settings JSON and print BADGES/SKIP_DISC\n"
+	       "  --system <dir>                Limit sync to a single ROM folder under --roms\n"
+	       "  --sync-json <path>            Sync only games with selected=1 in <path> (requires --system)\n"
+	       "  --badges <all|unlocked|none>  Which achievement badges to download (default: all)\n"
+	       "  --skip-disc-systems           Skip disc-based consoles when scanning\n"
+	       "  --userdata <dir>              Shared userdata dir (default: $SHARED_USERDATA_PATH or %s)\n"
+	       "  --roms <dir>                  ROMs root dir (default: $SDCARD_PATH/Roms or %s)\n"
+	       "  --fifo <path>                 FIFO path for show2.elf TEXT/PROGRESS updates\n"
+	       "  --delay-ms <ms>               Delay between HTTP requests (default: %d)\n"
+	       "  --limit <n>                   Maximum ROMs to scan\n"
+	       "  --dry-run                     Scan and hash only; do not write cache or hit network\n"
+	       "  --force                       Re-hash ROMs and re-fetch existing cache files\n"
+	       "  --refresh-sessions            Re-fetch startsession cache files for all matched games\n"
+	       "  --help                        Show this help message\n",
 	       prog, DEFAULT_USERDATA_PATH, DEFAULT_ROMS_PATH, HTTP_DEFAULT_DELAY_MS);
 }
 
 static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mode,
                        bool* list_systems_mode, bool* clear_unrecognized_mode,
-                       bool* cache_info_mode,
+                       bool* cache_info_mode, const char** parse_settings_path,
                        char* list_games_buf, size_t list_games_sz,
                        char* system_buf, size_t system_sz,
                        char* default_roms_buf, size_t roms_buf_sz) {
@@ -1562,6 +1631,8 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 	opts->sync_json_path = NULL;
 	opts->delay_ms = HTTP_DEFAULT_DELAY_MS;
 	opts->limit = 0;
+	opts->badge_mode = BADGE_MODE_ALL;
+	opts->skip_disc_systems = false;
 	opts->dry_run = false;
 	opts->force = false;
 	opts->refresh_sessions = false;
@@ -1569,6 +1640,7 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 	*list_systems_mode = false;
 	*clear_unrecognized_mode = false;
 	*cache_info_mode = false;
+	*parse_settings_path = NULL;
 	list_games_buf[0] = '\0';
 	system_buf[0] = '\0';
 
@@ -1581,6 +1653,8 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 			*clear_unrecognized_mode = true;
 		} else if (strcmp(argv[i], "--cache-info") == 0) {
 			*cache_info_mode = true;
+		} else if (strcmp(argv[i], "--parse-settings-json") == 0 && i + 1 < argc) {
+			*parse_settings_path = argv[++i];
 		} else if (strcmp(argv[i], "--list-games-json") == 0 && i + 1 < argc) {
 			normalize_folder_arg(argv[++i], list_games_buf, list_games_sz);
 		} else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
@@ -1588,6 +1662,14 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 			opts->system_folder = system_buf;
 		} else if (strcmp(argv[i], "--sync-json") == 0 && i + 1 < argc) {
 			opts->sync_json_path = argv[++i];
+		} else if (strcmp(argv[i], "--badges") == 0 && i + 1 < argc) {
+			const char* val = argv[++i];
+			if (!parse_badge_mode(val, &opts->badge_mode)) {
+				fprintf(stderr, "Invalid --badges mode: %s (expected all|unlocked|none)\n", val);
+				return false;
+			}
+		} else if (strcmp(argv[i], "--skip-disc-systems") == 0) {
+			opts->skip_disc_systems = true;
 		} else if (strcmp(argv[i], "--userdata") == 0 && i + 1 < argc) {
 			opts->userdata_dir = argv[++i];
 		} else if (strcmp(argv[i], "--roms") == 0 && i + 1 < argc) {
@@ -1673,7 +1755,7 @@ static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 
 	if (!opts->sync_json_path) {
 		ui_status(opts, 5, "Scanning ROM folders...");
-		if (!collect_roms(opts->roms_dir, opts->system_folder, opts->limit, &roms)) {
+		if (!collect_roms(opts->roms_dir, opts->system_folder, opts->skip_disc_systems, opts->limit, &roms)) {
 			ui_status(opts, -1, "Failed to scan ROM folders");
 			rom_list_free(&roms);
 			return false;
@@ -1781,8 +1863,9 @@ int main(int argc, char** argv) {
 	bool list_systems_mode = false;
 	bool clear_unrecognized_mode = false;
 	bool cache_info_mode = false;
+	const char* parse_settings_path = NULL;
 	if (!parse_args(argc, argv, &opts, &status_mode, &list_systems_mode,
-	                &clear_unrecognized_mode, &cache_info_mode,
+	                &clear_unrecognized_mode, &cache_info_mode, &parse_settings_path,
 	                list_games_buf, sizeof(list_games_buf),
 	                system_buf, sizeof(system_buf),
 	                default_roms_buf, sizeof(default_roms_buf))) {
@@ -1803,6 +1886,9 @@ int main(int argc, char** argv) {
 	}
 	if (cache_info_mode) {
 		return print_cache_info(&opts);
+	}
+	if (parse_settings_path) {
+		return parse_settings_json_cmd(parse_settings_path);
 	}
 
 	RunStats stats;

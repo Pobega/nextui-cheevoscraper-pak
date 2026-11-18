@@ -2,6 +2,7 @@
 #define RA_CONSOLES_H
 
 #include <rc_consoles.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -103,6 +104,30 @@ static inline void ra_extract_emu_tag(const char* folder_name, char* out, size_t
 	}
 	memcpy(out, folder_name, len);
 	out[len] = '\0';
+}
+
+static inline bool ra_is_disc_console(int console_id) {
+	switch (console_id) {
+		case RC_CONSOLE_SEGA_CD:
+		case RC_CONSOLE_PLAYSTATION:
+		case RC_CONSOLE_GAMECUBE:
+		case RC_CONSOLE_WII:
+		case RC_CONSOLE_WII_U:
+		case RC_CONSOLE_PLAYSTATION_2:
+		case RC_CONSOLE_XBOX:
+		case RC_CONSOLE_SATURN:
+		case RC_CONSOLE_DREAMCAST:
+		case RC_CONSOLE_PSP:
+		case RC_CONSOLE_CDI:
+		case RC_CONSOLE_3DO:
+		case RC_CONSOLE_PCFX:
+		case RC_CONSOLE_NEO_GEO_CD:
+		case RC_CONSOLE_PC_ENGINE_CD:
+		case RC_CONSOLE_ATARI_JAGUAR_CD:
+			return true;
+		default:
+			return false;
+	}
 }
 
 #endif

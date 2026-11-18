@@ -2,6 +2,7 @@
 
 #include "../src/cache_writer.h"
 #include "../src/ra_consoles.h"
+#include "../src/sync_opts.h"
 
 #include <rc_api_runtime.h>
 #include <rc_error.h>
@@ -358,6 +359,43 @@ static void test_cache_collect_stats(void) {
 	rmdir(tmp_dir);
 }
 
+static void test_ra_is_disc_console(void) {
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_PLAYSTATION));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_PLAYSTATION_2));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_PSP));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_SEGA_CD));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_SATURN));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_DREAMCAST));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_PC_ENGINE_CD));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_NEO_GEO_CD));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_3DO));
+	ASSERT_TRUE(ra_is_disc_console(RC_CONSOLE_GAMECUBE));
+
+	ASSERT_TRUE(!ra_is_disc_console(RC_CONSOLE_SUPER_NINTENDO));
+	ASSERT_TRUE(!ra_is_disc_console(RC_CONSOLE_GAMEBOY_ADVANCE));
+	ASSERT_TRUE(!ra_is_disc_console(RC_CONSOLE_MEGA_DRIVE));
+	ASSERT_TRUE(!ra_is_disc_console(RC_CONSOLE_ARCADE));
+	ASSERT_TRUE(!ra_is_disc_console(RC_CONSOLE_UNKNOWN));
+}
+
+static void test_parse_badge_mode(void) {
+	BadgeMode mode = BADGE_MODE_NONE;
+
+	ASSERT_TRUE(parse_badge_mode("all", &mode));
+	ASSERT_EQ_INT(BADGE_MODE_ALL, mode);
+
+	ASSERT_TRUE(parse_badge_mode("unlocked", &mode));
+	ASSERT_EQ_INT(BADGE_MODE_UNLOCKED, mode);
+
+	ASSERT_TRUE(parse_badge_mode("none", &mode));
+	ASSERT_EQ_INT(BADGE_MODE_NONE, mode);
+
+	ASSERT_TRUE(!parse_badge_mode("invalid", &mode));
+	ASSERT_TRUE(!parse_badge_mode("", &mode));
+	ASSERT_TRUE(!parse_badge_mode(NULL, &mode));
+	ASSERT_TRUE(!parse_badge_mode("all", NULL));
+}
+
 int main(void) {
 	test_ra_extract_emu_tag();
 	test_ra_get_console_id();
@@ -366,6 +404,8 @@ int main(void) {
 	test_game_sets_unrecognized_detection();
 	test_cache_format_size();
 	test_cache_collect_stats();
+	test_ra_is_disc_console();
+	test_parse_badge_mode();
 
 	if (g_tests_failed > 0) {
 		fprintf(stderr, "%d/%d assertions failed\n", g_tests_failed, g_tests_run);

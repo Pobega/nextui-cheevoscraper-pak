@@ -28,9 +28,39 @@ ACT_MENU_FILE="/tmp/${PAK_NAME}-action.txt"
 ACT_OUT_FILE="/tmp/${PAK_NAME}-action.out"
 GAMES_JSON="/tmp/${PAK_NAME}-games.json"
 GAMES_OUT="/tmp/${PAK_NAME}-games.out"
+SETTINGS_JSON="/tmp/${PAK_NAME}-settings.json"
+SETTINGS_OUT="/tmp/${PAK_NAME}-settings.out"
+SETTINGS_FILE="${USERDATA_PATH:-/tmp}/$PAK_NAME/settings.conf"
+BADGES="all"
+SKIP_DISC="0"
 FIFO_PATH="/tmp/show2.fifo"
 SHOW2_PID=""
 PRESENTER_PID=""
+
+load_settings() {
+	BADGES="all"
+	SKIP_DISC="0"
+	[ -f "$SETTINGS_FILE" ] || return 0
+	while IFS='=' read -r s_key s_val; do
+		case "$s_key" in
+			BADGES)
+				case "$s_val" in
+					all|unlocked|none) BADGES="$s_val" ;;
+				esac
+				;;
+			SKIP_DISC)
+				case "$s_val" in
+					0|1) SKIP_DISC="$s_val" ;;
+				esac
+				;;
+		esac
+	done < "$SETTINGS_FILE"
+}
+
+save_settings() {
+	mkdir -p "$(dirname "$SETTINGS_FILE")"
+	printf 'BADGES=%s\nSKIP_DISC=%s\n' "$BADGES" "$SKIP_DISC" > "$SETTINGS_FILE"
+}
 
 stop_progress_ui() {
 	if [ -n "$SHOW2_PID" ]; then
@@ -78,7 +108,11 @@ run_sync_with_ui() {
 	fi
 
 	: > "$SYNC_LOG"
-	"$BIN" "$@" --fifo "$FIFO_PATH" > "$SYNC_LOG" 2>&1
+	if [ "$SKIP_DISC" = "1" ]; then
+		"$BIN" --badges "$BADGES" --skip-disc-systems "$@" --fifo "$FIFO_PATH" > "$SYNC_LOG" 2>&1
+	else
+		"$BIN" --badges "$BADGES" "$@" --fifo "$FIFO_PATH" > "$SYNC_LOG" 2>&1
+	fi
 	SYNC_RC=$?
 	cat "$SYNC_LOG"
 
@@ -98,7 +132,12 @@ run_sync_with_ui() {
 system_menu() {
 	TAB="$(printf '\t')"
 	while true; do
-		if ! "$BIN" --list-systems > "$SYS_LIST_TSV" 2>/dev/null; then
+		if [ "$SKIP_DISC" = "1" ]; then
+			"$BIN" --list-systems --skip-disc-systems > "$SYS_LIST_TSV" 2>/dev/null
+		else
+			"$BIN" --list-systems > "$SYS_LIST_TSV" 2>/dev/null
+		fi
+		if [ $? -ne 0 ]; then
 			minui-presenter --message "Failed to scan ROM systems" --timeout 0 --confirm-show --confirm-text "OK"
 			return
 		fi
@@ -181,6 +220,46 @@ EOF
 	done
 }
 
+settings_menu() {
+	b_idx=0
+	case "$BADGES" in
+		unlocked) b_idx=1 ;;
+		none)     b_idx=2 ;;
+	esac
+	d_idx=0
+	[ "$SKIP_DISC" = "1" ] && d_idx=1
+
+	cat << EOF > "$SETTINGS_JSON"
+{"settings":[{"name":"Download Badges","options":["All","Unlocked Only","None"],"selected":$b_idx},{"name":"Skip Disc Systems","options":["Off","On"],"selected":$d_idx}]}
+EOF
+
+	rm -f "$SETTINGS_OUT"
+	minui-list --disable-auto-sleep --file "$SETTINGS_JSON" --format json --item-key settings --title "RA Cache Settings" --confirm-text "SAVE" --write-value state --write-location "$SETTINGS_OUT" >/dev/null
+	RC=$?
+	if [ "$RC" -eq 0 ] && [ -f "$SETTINGS_OUT" ]; then
+		PARSED="$("$BIN" --parse-settings-json "$SETTINGS_OUT" 2>/dev/null)"
+		if [ $? -eq 0 ] && [ -n "$PARSED" ]; then
+			while IFS='=' read -r p_key p_val; do
+				case "$p_key" in
+					BADGES)
+						case "$p_val" in
+							all|unlocked|none) BADGES="$p_val" ;;
+						esac
+						;;
+					SKIP_DISC)
+						case "$p_val" in
+							0|1) SKIP_DISC="$p_val" ;;
+						esac
+						;;
+				esac
+			done << EOF
+$PARSED
+EOF
+			save_settings
+		fi
+	fi
+}
+
 echo "1" > /tmp/stay_awake
 trap cleanup EXIT INT TERM HUP QUIT
 
@@ -203,6 +282,8 @@ elif [ "$STATUS_RC" -ne 0 ]; then
 	exit 1
 fi
 
+load_settings
+
 cat << 'EOF' > "$MENU_FILE"
 Sync New Games
 Sync by System...
@@ -210,6 +291,7 @@ Refresh Sessions
 Force Rebuild Cache
 Re-check Unrecognized
 Cache Info
+Settings
 Exit
 EOF
 
@@ -243,6 +325,9 @@ while true; do
 		"Cache Info")
 			INFO="$("$BIN" --cache-info)"
 			minui-presenter --message "$INFO" --timeout 0 --confirm-show --confirm-text "OK"
+			;;
+		"Settings")
+			settings_menu
 			;;
 		"Exit"|"")
 			break
