@@ -83,7 +83,7 @@ EOF
 while true; do
 	STATUS_LINE="$("$BIN" --status)" || break
 	rm -f "$OUT_FILE"
-	minui-list --disable-auto-sleep --file "$MENU_FILE" --title "$STATUS_LINE" --confirm-text "SELECT" --write-location "$OUT_FILE" >/dev/null
+	minui-list --disable-auto-sleep --file "$MENU_FILE" --format text --title "$STATUS_LINE" --confirm-text "SELECT" --write-location "$OUT_FILE" >/dev/null
 	RC=$?
 	if [ "$RC" -ne 0 ] || [ ! -f "$OUT_FILE" ]; then
 		break
