@@ -35,6 +35,9 @@ BADGES="all"
 SKIP_DISC="0"
 FIFO_PATH="/tmp/show2.fifo"
 SHOW2_PID=""
+BUSY_PID=""
+STATUS_DIRTY=0
+SYS_LIST_CACHED_SKIP_DISC=""
 PRESENTER_PID=""
 
 load_settings() {
@@ -62,7 +65,22 @@ save_settings() {
 	printf 'BADGES=%s\nSKIP_DISC=%s\n' "$BADGES" "$SKIP_DISC" > "$SETTINGS_FILE"
 }
 
+start_busy() {
+	stop_busy
+	minui-presenter --message "$1" --timeout -1 >/dev/null 2>&1 &
+	BUSY_PID=$!
+}
+
+stop_busy() {
+	if [ -n "$BUSY_PID" ] && kill -0 "$BUSY_PID" 2>/dev/null; then
+		kill "$BUSY_PID" 2>/dev/null || true
+		wait "$BUSY_PID" 2>/dev/null || true
+	fi
+	BUSY_PID=""
+}
+
 stop_progress_ui() {
+	stop_busy
 	if [ -n "$SHOW2_PID" ]; then
 		if [ -p "$FIFO_PATH" ] && kill -0 "$SHOW2_PID" 2>/dev/null; then
 			echo "QUIT" > "$FIFO_PATH" &
@@ -132,31 +150,40 @@ run_sync_with_ui() {
 system_menu() {
 	TAB="$(printf '\t')"
 	while true; do
-		if [ "$SKIP_DISC" = "1" ]; then
-			"$BIN" --list-systems --skip-disc-systems > "$SYS_LIST_TSV" 2>/dev/null
-		else
-			"$BIN" --list-systems > "$SYS_LIST_TSV" 2>/dev/null
-		fi
-		if [ $? -ne 0 ]; then
-			minui-presenter --message "Failed to scan ROM systems" --timeout 0 --confirm-show --confirm-text "OK"
-			return
-		fi
+		if [ ! -s "$SYS_LIST_TSV" ] || [ "$SYS_LIST_CACHED_SKIP_DISC" != "$SKIP_DISC" ]; then
+			start_busy "Scanning ROM systems..."
+			if [ "$SKIP_DISC" = "1" ]; then
+				"$BIN" --list-systems --skip-disc-systems > "$SYS_LIST_TSV" 2>/dev/null
+			else
+				"$BIN" --list-systems > "$SYS_LIST_TSV" 2>/dev/null
+			fi
+			LIST_RC=$?
+			stop_busy
+			if [ "$LIST_RC" -ne 0 ]; then
+				rm -f "$SYS_LIST_TSV"
+				SYS_LIST_CACHED_SKIP_DISC=""
+				minui-presenter --message "Failed to scan ROM systems" --timeout 0 --confirm-show --confirm-text "OK"
+				return
+			fi
 
-		if [ ! -s "$SYS_LIST_TSV" ]; then
-			minui-presenter --message "No supported ROM systems found" --timeout 0 --confirm-show --confirm-text "OK"
-			return
-		fi
+			if [ ! -s "$SYS_LIST_TSV" ]; then
+				SYS_LIST_CACHED_SKIP_DISC=""
+				minui-presenter --message "No supported ROM systems found" --timeout 0 --confirm-show --confirm-text "OK"
+				return
+			fi
 
-		printf '[' > "$SYS_MENU_FILE"
-		first_sys=1
-		while IFS="$TAB" read -r s_folder s_tag s_count; do
-			[ -n "$s_folder" ] || continue
-			esc_folder="$(printf '%s' "$s_folder" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-			[ "$first_sys" -eq 0 ] && printf ',' >> "$SYS_MENU_FILE"
-			printf '"%s (%s ROMs)"' "$esc_folder" "$s_count" >> "$SYS_MENU_FILE"
-			first_sys=0
-		done < "$SYS_LIST_TSV"
-		printf ']\n' >> "$SYS_MENU_FILE"
+			printf '[' > "$SYS_MENU_FILE"
+			first_sys=1
+			while IFS="$TAB" read -r s_folder s_tag s_count; do
+				[ -n "$s_folder" ] || continue
+				esc_folder="$(printf '%s' "$s_folder" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+				[ "$first_sys" -eq 0 ] && printf ',' >> "$SYS_MENU_FILE"
+				printf '"%s (%s ROMs)"' "$esc_folder" "$s_count" >> "$SYS_MENU_FILE"
+				first_sys=0
+			done < "$SYS_LIST_TSV"
+			printf ']\n' >> "$SYS_MENU_FILE"
+			SYS_LIST_CACHED_SKIP_DISC="$SKIP_DISC"
+		fi
 
 		rm -f "$SYS_OUT_FILE"
 		minui-list --disable-auto-sleep --file "$SYS_MENU_FILE" --format json --title "Sync by System" --confirm-text "SELECT" --write-location "$SYS_OUT_FILE" >/dev/null
@@ -195,12 +222,18 @@ EOF
 			case "$ACT_CHOICE" in
 				"Sync Uncached in $SYS_TAG")
 					run_sync_with_ui --system "$SYS_FOLDER"
+					STATUS_DIRTY=1
 					;;
 				"Sync All in $SYS_TAG")
 					run_sync_with_ui --system "$SYS_FOLDER" --force
+					STATUS_DIRTY=1
 					;;
 				"Select Games Manually...")
-					if ! "$BIN" --list-games-json "$SYS_FOLDER" > "$GAMES_JSON" 2>/dev/null || [ ! -s "$GAMES_JSON" ]; then
+					start_busy "Scanning $SYS_FOLDER..."
+					"$BIN" --list-games-json "$SYS_FOLDER" > "$GAMES_JSON" 2>/dev/null
+					GAMES_RC=$?
+					stop_busy
+					if [ "$GAMES_RC" -ne 0 ] || [ ! -s "$GAMES_JSON" ]; then
 						minui-presenter --message "Failed to list games for $SYS_FOLDER" --timeout 0 --confirm-show --confirm-text "OK"
 						continue
 					fi
@@ -209,6 +242,7 @@ EOF
 					RC=$?
 					if [ "$RC" -eq 0 ] && [ -f "$GAMES_OUT" ]; then
 						run_sync_with_ui --system "$SYS_FOLDER" --sync-json "$GAMES_OUT" --force
+						STATUS_DIRTY=1
 					fi
 					;;
 				"Back"|"")
@@ -291,7 +325,10 @@ cat << 'EOF' > "$MENU_FILE"
 EOF
 
 while true; do
-	STATUS_LINE="$("$BIN" --status)" || break
+	if [ "$STATUS_DIRTY" -eq 1 ]; then
+		STATUS_LINE="$("$BIN" --status)" || break
+		STATUS_DIRTY=0
+	fi
 	rm -f "$OUT_FILE"
 	minui-list --disable-auto-sleep --file "$MENU_FILE" --format json --title "$STATUS_LINE" --confirm-text "SELECT" --write-location "$OUT_FILE" >/dev/null
 	RC=$?
@@ -304,22 +341,28 @@ while true; do
 	case "$CHOICE" in
 		"Sync New Games")
 			run_sync_with_ui
+			STATUS_DIRTY=1
 			;;
 		"Sync by System...")
 			system_menu
 			;;
 		"Refresh Sessions")
 			run_sync_with_ui --refresh-sessions
+			STATUS_DIRTY=1
 			;;
 		"Force Rebuild Cache")
 			run_sync_with_ui --force
+			STATUS_DIRTY=1
 			;;
 		"Re-check Unrecognized")
 			OUT="$("$BIN" --clear-unrecognized 2>&1)"
+			STATUS_DIRTY=1
 			minui-presenter --message "$OUT" --timeout 0 --confirm-show --confirm-text "OK"
 			;;
 		"Cache Info")
+			start_busy "Calculating cache stats..."
 			INFO="$("$BIN" --cache-info)"
+			stop_busy
 			minui-presenter --message "$INFO" --timeout 0 --confirm-show --confirm-text "OK"
 			;;
 		"Settings")
