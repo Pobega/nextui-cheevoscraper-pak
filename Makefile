@@ -7,6 +7,9 @@ PUSH_SDCARD_PATH ?= /mnt/SDCARD
 RCHEEVOS_REPO ?= https://github.com/RetroAchievements/rcheevos.git
 RCHEEVOS_COMMIT ?= 40d916de00fe757bab40fb4db41a7912193a48e3
 
+LIBCHDR_REPO ?= https://github.com/rtissera/libchdr.git
+LIBCHDR_COMMIT ?= 47d794151b2b64f6aba60304e6480f4f5a2bc24b
+
 CONTAINER_RUNTIME ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null || (command -v flatpak-spawn >/dev/null 2>&1 && echo "flatpak-spawn --host podman"))
 ifneq (,$(findstring podman,$(CONTAINER_RUNTIME)))
 CONTAINER_MOUNT_OPTS ?= --security-opt label=disable
@@ -16,6 +19,7 @@ endif
 
 BUILD_DIR := $(CURDIR)/build
 RCHEEVOS_DIR := $(BUILD_DIR)/rcheevos
+LIBCHDR_DIR := $(BUILD_DIR)/libchdr
 DIST_DIR := $(CURDIR)/dist
 
 RCHEEVOS_SRCDIR := $(RCHEEVOS_DIR)/src
@@ -58,6 +62,7 @@ MINUI_PRESENTER_VERSION := 0.13.4
 APP_SOURCES := \
 	$(CURDIR)/src/main.c \
 	$(CURDIR)/src/cache_writer.c \
+	$(CURDIR)/src/chd_reader.c \
 	$(CURDIR)/src/http_client.c \
 	$(CURDIR)/src/rom_hasher.c
 
@@ -70,14 +75,31 @@ TARGET_OPT ?= -O2
 PLAT_BUILD := $(BUILD_DIR)/$(TARGET_PLATFORM)
 RCHEEVOS_OBJS := $(patsubst $(RCHEEVOS_SRCDIR)/%.c,$(PLAT_BUILD)/rcheevos-obj/%.o,$(RCHEEVOS_SOURCES))
 RCHEEVOS_LIB := $(PLAT_BUILD)/librcheevos.a
+LIBCHDR_BUILD := $(PLAT_BUILD)/libchdr-build
+LIBCHDR_PREFIX := $(PLAT_BUILD)/libchdr-install
+LIBCHDR_LIB := $(LIBCHDR_PREFIX)/lib/libchdr.a
 APP_OBJS := $(patsubst $(CURDIR)/src/%.c,$(PLAT_BUILD)/app-obj/%.o,$(APP_SOURCES))
 APP_BIN := $(BUILD_DIR)/bin/$(TARGET_PLATFORM)/ra-cache
 
 RCHEEVOS_CFLAGS := $(TARGET_OPT) -std=gnu99 -I$(RCHEEVOS_INCDIR) -I$(RCHEEVOS_SRCDIR) -DRC_DISABLE_LUA
-APP_CFLAGS := $(TARGET_OPT) -std=gnu99 -Wall -Wextra -Werror -I$(RCHEEVOS_INCDIR) -I$(CURDIR)/src
-APP_LDFLAGS := -lcrypto -lzip -lpthread -lm
+APP_CFLAGS := $(TARGET_OPT) -std=gnu99 -Wall -Wextra -Werror -I$(RCHEEVOS_INCDIR) -I$(LIBCHDR_DIR)/include -I$(CURDIR)/src
+APP_LDFLAGS := -L$(LIBCHDR_PREFIX)/lib -lcrypto -lzip -lchdr -lchdr-lzma -lzstd -lz -llz4 -lpthread -lm
 
-.PHONY: all rcheevos host internal-build build package push deploy clean distclean $(foreach p,$(PLATFORMS),build-$(p))
+LIBCHDR_CMAKE_ARGS := \
+	-DBUILD_SHARED_LIBS=OFF \
+	-DINSTALL_STATIC_LIBS=ON \
+	-DCHDR_WANT_TESTS=OFF \
+	-DWITH_SYSTEM_ZLIB=ON \
+	-DWITH_SYSTEM_ZSTD=OFF \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DCMAKE_INSTALL_LIBDIR=lib \
+	-DCMAKE_INSTALL_PREFIX=$(LIBCHDR_PREFIX) \
+	-DCMAKE_C_FLAGS="$(TARGET_OPT)"
+ifdef CMAKE_TOOLCHAIN_FILE
+LIBCHDR_CMAKE_ARGS += -DCMAKE_TOOLCHAIN_FILE=$(CMAKE_TOOLCHAIN_FILE)
+endif
+
+.PHONY: all rcheevos libchdr host internal-build build package push deploy clean distclean $(foreach p,$(PLATFORMS),build-$(p))
 
 all: build package
 
@@ -92,6 +114,24 @@ $(RCHEEVOS_DIR)/.checked_out:
 	@git -C $(RCHEEVOS_DIR) checkout -q $(RCHEEVOS_COMMIT)
 	@touch $@
 
+libchdr: $(LIBCHDR_DIR)/.checked_out
+
+$(LIBCHDR_DIR)/.checked_out:
+	@mkdir -p $(BUILD_DIR)
+	@if [ ! -d "$(LIBCHDR_DIR)/.git" ]; then \
+		echo "Cloning $(LIBCHDR_REPO)..."; \
+		git clone $(LIBCHDR_REPO) $(LIBCHDR_DIR); \
+	fi
+	@git -C $(LIBCHDR_DIR) checkout -q $(LIBCHDR_COMMIT)
+	@touch $@
+
+$(LIBCHDR_LIB): $(LIBCHDR_DIR)/.checked_out
+	@mkdir -p $(LIBCHDR_BUILD)
+	cmake -S $(LIBCHDR_DIR) -B $(LIBCHDR_BUILD) $(LIBCHDR_CMAKE_ARGS)
+	cmake --build $(LIBCHDR_BUILD) -j$$(nproc)
+	cmake --install $(LIBCHDR_BUILD)
+	ln -sf libchdr-static.a $@
+
 $(PLAT_BUILD)/rcheevos-obj/%.o: $(RCHEEVOS_SRCDIR)/%.c
 	@mkdir -p $(dir $@)
 	$(TARGET_CC) $(RCHEEVOS_CFLAGS) -c -o $@ $<
@@ -104,13 +144,13 @@ $(PLAT_BUILD)/app-obj/%.o: $(CURDIR)/src/%.c
 	@mkdir -p $(dir $@)
 	$(TARGET_CC) $(APP_CFLAGS) -c -o $@ $<
 
-$(APP_BIN): $(APP_OBJS) $(RCHEEVOS_LIB)
+$(APP_BIN): $(APP_OBJS) $(RCHEEVOS_LIB) $(LIBCHDR_LIB)
 	@mkdir -p $(dir $@)
 	$(TARGET_CC) -o $@ $(APP_OBJS) $(RCHEEVOS_LIB) $(APP_LDFLAGS)
 
 internal-build: $(APP_BIN)
 
-host: rcheevos
+host: rcheevos libchdr
 	$(MAKE) internal-build TARGET_PLATFORM=host TARGET_CC=gcc TARGET_AR=ar
 
 $(BUILD_DIR)/bin/h700/minui-list:
@@ -136,7 +176,7 @@ $(BUILD_DIR)/bin/%/minui-presenter:
 build: $(foreach p,$(PLATFORMS),build-$(p))
 
 define BUILD_PLATFORM_RULE
-build-$(1): rcheevos $(BUILD_DIR)/bin/$(1)/minui-list $(BUILD_DIR)/bin/$(1)/minui-presenter
+build-$(1): rcheevos libchdr $(BUILD_DIR)/bin/$(1)/minui-list $(BUILD_DIR)/bin/$(1)/minui-presenter
 	@if [ -z "$$(CONTAINER_RUNTIME)" ]; then \
 		echo "Error: neither podman nor docker found in PATH"; exit 1; \
 	fi
