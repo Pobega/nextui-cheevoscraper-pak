@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/input.h>
 #include <rc_api_runtime.h>
 #include <rc_api_user.h>
 #include <rc_error.h>
@@ -219,6 +220,90 @@ static const char* effective_username(const RASettings* s) {
 		return s->server_username;
 	}
 	return s->username;
+}
+
+static void resolve_display_name(const char* userdata_dir, const RASettings* s,
+                                 char* out, size_t out_size) {
+	const char* fallback = effective_username(s);
+	copy_str_bounded(out, out_size, fallback);
+
+	char login_path[CACHE_MAX_PATH];
+	cache_login_path(userdata_dir, login_path, sizeof(login_path));
+
+	char* body = NULL;
+	size_t body_len = 0;
+	if (!cache_read_file(login_path, &body, &body_len)) {
+		return;
+	}
+
+	rc_api_login_response_t resp;
+	rc_api_server_response_t srv = {
+		.body = body,
+		.body_length = body_len,
+		.http_status_code = HTTP_STATUS_OK
+	};
+	if (rc_api_process_login_server_response(&resp, &srv) == RC_OK &&
+	    resp.display_name && *resp.display_name) {
+		copy_str_bounded(out, out_size, resp.display_name);
+	}
+	rc_api_destroy_login_response(&resp);
+	free(body);
+}
+
+#define CANCEL_MAX_FDS 16
+#define INPUT_CODE_B 305
+
+typedef struct {
+	int fds[CANCEL_MAX_FDS];
+	size_t count;
+	bool cancelled;
+} CancelInput;
+
+static void cancel_input_open(CancelInput* ci) {
+	memset(ci, 0, sizeof(*ci));
+	DIR* dir = opendir("/dev/input");
+	if (!dir) {
+		return;
+	}
+	struct dirent* ent;
+	while ((ent = readdir(dir)) != NULL && ci->count < CANCEL_MAX_FDS) {
+		if (strncmp(ent->d_name, "event", 5) != 0) {
+			continue;
+		}
+		char path[300];
+		if (snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name) >= (int)sizeof(path)) {
+			continue;
+		}
+		int fd = open(path, O_RDONLY | O_NONBLOCK);
+		if (fd >= 0) {
+			ci->fds[ci->count++] = fd;
+		}
+	}
+	closedir(dir);
+}
+
+static bool cancel_input_poll(CancelInput* ci) {
+	if (ci->cancelled) {
+		return true;
+	}
+	for (size_t i = 0; i < ci->count; i++) {
+		struct input_event ev;
+		while (read(ci->fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+			if (ev.type == EV_KEY && ev.value == 1 &&
+			    (ev.code == INPUT_CODE_B || ev.code == KEY_ESC || ev.code == KEY_BACKSPACE)) {
+				ci->cancelled = true;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static void cancel_input_close(CancelInput* ci) {
+	for (size_t i = 0; i < ci->count; i++) {
+		close(ci->fds[i]);
+	}
+	ci->count = 0;
 }
 
 static bool rom_list_push(RomList* list, const char* abs_path, const char* rel_path,
@@ -754,7 +839,9 @@ static int print_status(const SyncOptions* opts) {
 		count_ra_dir(ra_dir, &games, &badges);
 	}
 
-	printf("User: %s | Cached: %zu games, %zu badges\n", username, games, badges);
+	char display_name[SETTINGS_STR_MAX];
+	resolve_display_name(opts->userdata_dir, &settings, display_name, sizeof(display_name));
+	printf("User: %s | Cached: %zu games, %zu badges\n", display_name, games, badges);
 	return 0;
 }
 
@@ -1583,9 +1670,12 @@ static int clear_unrecognized_cache(const char* userdata_dir) {
 static int print_cache_info(const SyncOptions* opts) {
 	RASettings settings;
 	bool loaded = load_ra_settings(opts->userdata_dir, &settings);
-	const char* username = (loaded && *effective_username(&settings))
-		? effective_username(&settings)
-		: "(not logged in)";
+	char display_name[SETTINGS_STR_MAX];
+	if (loaded && *effective_username(&settings)) {
+		resolve_display_name(opts->userdata_dir, &settings, display_name, sizeof(display_name));
+	} else {
+		copy_str_bounded(display_name, sizeof(display_name), "(not logged in)");
+	}
 
 	CacheStats stats;
 	cache_collect_stats(opts->userdata_dir, classify_achievementsets_file, &stats);
@@ -1599,7 +1689,7 @@ static int print_cache_info(const SyncOptions* opts) {
 	       "Indexed ROMs: %zu\n"
 	       "Cached Badges: %zu\n"
 	       "Cache Size: %s\n",
-	       username,
+	       display_name,
 	       stats.recognized_games,
 	       stats.unrecognized_games,
 	       stats.indexed_roms,
@@ -1733,6 +1823,108 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 	return true;
 }
 
+static bool refresh_cached_sessions(const SyncOptions* opts, HttpClient* http,
+                                    const char* username, const RASettings* settings,
+                                    RunStats* out_stats, CancelInput* cancel) {
+	char cache_dir[CACHE_MAX_PATH];
+	if (snprintf(cache_dir, sizeof(cache_dir), "%s/.ra/offline/cache", opts->userdata_dir) >= (int)sizeof(cache_dir)) {
+		return false;
+	}
+
+	DIR* dir = opendir(cache_dir);
+	if (!dir) {
+		ui_status(opts, -1, "No cached games found");
+		return false;
+	}
+
+	char** hashes = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+	struct dirent* ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (strncmp(ent->d_name, "achievementsets_", 16) != 0 || !has_suffix(ent->d_name, ".bin")) {
+			continue;
+		}
+		size_t name_len = strlen(ent->d_name);
+		size_t hash_len = name_len - 16 - 4;
+		if (hash_len == 0 || hash_len >= CACHE_HASH_LEN) {
+			continue;
+		}
+		if (count == cap) {
+			size_t next_cap = cap ? cap * 2 : 32;
+			char** grown = (char**)realloc(hashes, next_cap * sizeof(char*));
+			if (!grown) {
+				break;
+			}
+			hashes = grown;
+			cap = next_cap;
+		}
+		char* h = (char*)malloc(hash_len + 1);
+		if (!h) {
+			break;
+		}
+		memcpy(h, ent->d_name + 16, hash_len);
+		h[hash_len] = '\0';
+		hashes[count++] = h;
+	}
+	closedir(dir);
+
+	out_stats->roms_scanned = count;
+	bool cancelled = false;
+	for (size_t i = 0; i < count; i++) {
+		if (cancel_input_poll(cancel)) {
+			cancelled = true;
+			break;
+		}
+		const char* hash = hashes[i];
+		char ach_path[CACHE_MAX_PATH];
+		cache_achievementsets_path(opts->userdata_dir, hash, ach_path, sizeof(ach_path));
+
+		char* body = NULL;
+		size_t body_len = 0;
+		if (!cache_read_file(ach_path, &body, &body_len)) {
+			continue;
+		}
+
+		rc_api_fetch_game_sets_response_t sets;
+		rc_api_server_response_t srv = {
+			.body = body,
+			.body_length = body_len,
+			.http_status_code = HTTP_STATUS_OK
+		};
+		int rc = rc_api_process_fetch_game_sets_server_response(&sets, &srv);
+		free(body);
+		if (rc == RC_OK && sets.id != 0) {
+			out_stats->unique_games++;
+			out_stats->sets_cached++;
+			int pct = count > 0 ? (int)(((i + 1) * PROGRESS_COMPLETE) / count) : PROGRESS_COMPLETE;
+			const char* title = (sets.title && *sets.title) ? sets.title : hash;
+			ui_status(opts, pct, "Refreshing (%zu/%zu): %s (B: Cancel)", i + 1, count, title);
+			uint32_t session_gid = sets.session_game_id ? sets.session_game_id : sets.id;
+			cache_startsession(opts, http, username, settings->token,
+			                   settings->hardcore, session_gid, hash, out_stats);
+		}
+		rc_api_destroy_fetch_game_sets_response(&sets);
+	}
+
+	for (size_t i = 0; i < count; i++) {
+		free(hashes[i]);
+	}
+	free(hashes);
+
+	ui_status(opts, PROGRESS_COMPLETE,
+	          cancelled ? "Cancelled! %zu sessions refreshed, %zu errors"
+	                    : "Done! %zu sessions refreshed, %zu errors",
+	          out_stats->sessions_fetched, out_stats->errors);
+	printf("SUMMARY: Scanned %zu | Matched %zu | Cached %zu | Badges %zu | Errors %zu%s\n",
+	       out_stats->roms_scanned, out_stats->unique_games,
+	       out_stats->sets_fetched + out_stats->sets_cached,
+	       out_stats->badges_downloaded, out_stats->errors,
+	       cancelled ? " (Cancelled)" : "");
+	fflush(stdout);
+	return true;
+}
+
 static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 	memset(out_stats, 0, sizeof(*out_stats));
 
@@ -1783,9 +1975,20 @@ static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 		return false;
 	}
 
+	CancelInput cancel;
+	cancel_input_open(&cancel);
+
+	if (opts->refresh_sessions && !opts->system_folder && !opts->sync_json_path && !opts->force && !opts->dry_run) {
+		bool ok = refresh_cached_sessions(opts, &http, username, &settings, out_stats, &cancel);
+		cancel_input_close(&cancel);
+		rom_list_free(&roms);
+		return ok;
+	}
+
 	if (!opts->sync_json_path) {
 		ui_status(opts, 5, "Scanning ROM folders...");
 		if (!collect_roms(opts->roms_dir, opts->system_folder, opts->skip_disc_systems, opts->limit, &roms)) {
+			cancel_input_close(&cancel);
 			ui_status(opts, -1, "Failed to scan ROM folders");
 			rom_list_free(&roms);
 			return false;
@@ -1802,8 +2005,13 @@ static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 
 	out_stats->roms_scanned = roms.count;
 
+	bool cancelled = false;
 	HashSet unique_hashes = {0};
 	for (size_t i = 0; i < roms.count; i++) {
+		if (cancel_input_poll(&cancel)) {
+			cancelled = true;
+			break;
+		}
 		RomEntry* rom = &roms.items[i];
 		const char* rom_name = basename_ptr(rom->rel_path);
 		int pct = roms.count > 0
@@ -1817,7 +2025,7 @@ static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 			snprintf(rom->hash, sizeof(rom->hash), "%s", cached_hash);
 			out_stats->index_hits++;
 		} else {
-			ui_status(opts, pct, "Hashing (%zu/%zu): %s", i + 1, roms.count, rom_name);
+			ui_status(opts, pct, "Hashing (%zu/%zu): %s (B: Cancel)", i + 1, roms.count, rom_name);
 			if (!rom_hash_file(rom->abs_path, rom->console_id, rom->hash)) {
 				out_stats->hash_failures++;
 				continue;
@@ -1839,13 +2047,17 @@ static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 	out_stats->unique_games = unique_hashes.count;
 	StringSet seen_badges = {0};
 
-	for (size_t i = 0; i < unique_hashes.count; i++) {
+	for (size_t i = 0; i < unique_hashes.count && !cancelled; i++) {
+		if (cancel_input_poll(&cancel)) {
+			cancelled = true;
+			break;
+		}
 		const char* hash = unique_hashes.hashes[i];
 		const char* name = unique_hashes.sample_names[i];
 		int pct = PROGRESS_SCAN_MAX +
 			(int)(((i + 1) * (PROGRESS_COMPLETE - PROGRESS_SCAN_MAX)) / unique_hashes.count);
 
-		ui_status(opts, pct, "Caching (%zu/%zu): %s", i + 1, unique_hashes.count, name);
+		ui_status(opts, pct, "Caching (%zu/%zu): %s (B: Cancel)", i + 1, unique_hashes.count, name);
 
 		rc_api_fetch_game_sets_response_t sets;
 		if (!fetch_or_load_game_sets(opts, &http, username, settings.token, hash, &sets, out_stats)) {
@@ -1862,23 +2074,27 @@ static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 		rc_api_destroy_fetch_game_sets_response(&sets);
 	}
 
+	cancel_input_close(&cancel);
 	string_set_free(&seen_badges);
 	hash_set_free(&unique_hashes);
 
 	ui_status(opts, PROGRESS_COMPLETE,
-	          "Done! %zu games (%zu fetched, %zu cached), %zu badges, %zu errors",
+	          cancelled ? "Cancelled! %zu games (%zu fetched, %zu cached), %zu badges, %zu errors"
+	                    : "Done! %zu games (%zu fetched, %zu cached), %zu badges, %zu errors",
 	          out_stats->unique_games, out_stats->sets_fetched, out_stats->sets_cached,
 	          out_stats->badges_downloaded, out_stats->errors);
 
 	printf("Summary: scanned=%zu index_hits=%zu hashed=%zu hash_fail=%zu unique=%zu "
-	       "sets_fetched=%zu sets_cached=%zu sessions=%zu badges=%zu errors=%zu\n",
+	       "sets_fetched=%zu sets_cached=%zu sessions=%zu badges=%zu errors=%zu cancelled=%d\n",
 	       out_stats->roms_scanned, out_stats->index_hits, out_stats->roms_hashed, out_stats->hash_failures,
 	       out_stats->unique_games, out_stats->sets_fetched, out_stats->sets_cached,
-	       out_stats->sessions_fetched, out_stats->badges_downloaded, out_stats->errors);
-	printf("SUMMARY: Scanned %zu | Matched %zu | Cached %zu | Badges %zu | Errors %zu\n",
+	       out_stats->sessions_fetched, out_stats->badges_downloaded, out_stats->errors,
+	       cancelled ? 1 : 0);
+	printf("SUMMARY: Scanned %zu | Matched %zu | Cached %zu | Badges %zu | Errors %zu%s\n",
 	       out_stats->roms_scanned, out_stats->unique_games,
 	       out_stats->sets_fetched + out_stats->sets_cached,
-	       out_stats->badges_downloaded, out_stats->errors);
+	       out_stats->badges_downloaded, out_stats->errors,
+	       cancelled ? " (Cancelled)" : "");
 	fflush(stdout);
 
 	return true;

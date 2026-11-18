@@ -106,14 +106,20 @@ cleanup() {
 	rm -f "/tmp/${PAK_NAME}-"* /tmp/stay_awake
 }
 
+confirm_action() {
+	minui-presenter --message "$1" --timeout 0 --confirm-show --confirm-text "CONTINUE" --cancel-show --cancel-text "CANCEL" >/dev/null 2>&1
+}
+
 run_sync_with_ui() {
+	INIT_MSG="Syncing games..."
+	case " $* " in
+		*" --refresh-sessions "*) INIT_MSG="Refreshing sessions..." ;;
+		*" --force "*)            INIT_MSG="Rebuilding cache..." ;;
+	esac
+
 	if command -v show2.elf >/dev/null 2>&1; then
-		LOGO_PATH=""
-		if [ -n "$SDCARD_PATH" ] && [ -f "$SDCARD_PATH/.system/res/logo.png" ]; then
-			LOGO_PATH="$SDCARD_PATH/.system/res/logo.png"
-		fi
 		rm -f "$FIFO_PATH"
-		show2.elf --mode=daemon --image="$LOGO_PATH" --text="Starting RA Cache..." --progress=0 >/dev/null 2>&1 &
+		show2.elf --mode=daemon --text="$INIT_MSG" --progress=0 >/dev/null 2>&1 &
 		SHOW2_PID=$!
 		wait_i=0
 		while [ ! -p "$FIFO_PATH" ] && [ "$wait_i" -lt 20 ]; do
@@ -121,7 +127,7 @@ run_sync_with_ui() {
 			wait_i=$((wait_i + 1))
 		done
 	else
-		minui-presenter --message "Running..." --timeout -1 >/dev/null 2>&1 &
+		minui-presenter --message "$INIT_MSG" --timeout -1 >/dev/null 2>&1 &
 		PRESENTER_PID=$!
 	fi
 
@@ -312,8 +318,10 @@ EOF
 		T_CHOICE="$(cat "$TOOLS_OUT_FILE")"
 		case "$T_CHOICE" in
 			"Force Rebuild Cache")
-				run_sync_with_ui --force
-				STATUS_DIRTY=1
+				if confirm_action "Re-hash and re-fetch ALL games?\nThis may take a long time."; then
+					run_sync_with_ui --force
+					STATUS_DIRTY=1
+				fi
 				;;
 			"Re-check Unrecognized")
 				OUT="$("$BIN" --clear-unrecognized 2>&1)"
@@ -359,7 +367,7 @@ fi
 load_settings
 
 cat << 'EOF' > "$MENU_FILE"
-["Sync New Games","Sync by System...","Refresh Sessions","Cache Tools...","Settings","Exit"]
+["Sync by System...","Sync New Games","Refresh Sessions","Cache Tools...","Settings","Exit"]
 EOF
 
 while true; do
@@ -377,16 +385,20 @@ while true; do
 
 	CHOICE="$(cat "$OUT_FILE")"
 	case "$CHOICE" in
-		"Sync New Games")
-			run_sync_with_ui
-			STATUS_DIRTY=1
-			;;
 		"Sync by System...")
 			system_menu
 			;;
+		"Sync New Games")
+			if confirm_action "Scan all ROM folders and cache new games?\nThis may take a while."; then
+				run_sync_with_ui
+				STATUS_DIRTY=1
+			fi
+			;;
 		"Refresh Sessions")
-			run_sync_with_ui --refresh-sessions
-			STATUS_DIRTY=1
+			if confirm_action "Refresh session unlocks for all cached games?"; then
+				run_sync_with_ui --refresh-sessions
+				STATUS_DIRTY=1
+			fi
 			;;
 		"Cache Tools...")
 			cache_tools_menu
