@@ -208,6 +208,7 @@ Sync New Games
 Sync by System...
 Refresh Sessions
 Force Rebuild Cache
+Re-check Unrecognized
 Exit
 EOF
 
@@ -233,6 +234,10 @@ while true; do
 			;;
 		"Force Rebuild Cache")
 			run_sync_with_ui --force
+			;;
+		"Re-check Unrecognized")
+			OUT="$("$BIN" --clear-unrecognized 2>&1)"
+			minui-presenter --message "$OUT" --timeout 0 --confirm-show --confirm-text "OK"
 			;;
 		"Exit"|"")
 			break

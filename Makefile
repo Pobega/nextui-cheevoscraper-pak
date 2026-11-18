@@ -99,7 +99,7 @@ ifdef CMAKE_TOOLCHAIN_FILE
 LIBCHDR_CMAKE_ARGS += -DCMAKE_TOOLCHAIN_FILE=$(CMAKE_TOOLCHAIN_FILE)
 endif
 
-.PHONY: all rcheevos libchdr host internal-build build package push deploy clean distclean $(foreach p,$(PLATFORMS),build-$(p))
+.PHONY: all rcheevos libchdr host internal-build test build package push deploy clean distclean $(foreach p,$(PLATFORMS),build-$(p))
 
 all: build package
 
@@ -152,6 +152,17 @@ internal-build: $(APP_BIN)
 
 host: rcheevos libchdr
 	$(MAKE) internal-build TARGET_PLATFORM=host TARGET_CC=gcc TARGET_AR=ar
+
+TEST_BIN := $(BUILD_DIR)/host/test_unit
+
+test: rcheevos
+	$(MAKE) $(BUILD_DIR)/host/librcheevos.a TARGET_PLATFORM=host TARGET_CC=gcc TARGET_AR=ar
+	@mkdir -p $(dir $(TEST_BIN))
+	gcc -O2 -std=gnu99 -Wall -Wextra -Werror -DCACHE_WRITER_NO_CRYPTO \
+		-I$(RCHEEVOS_INCDIR) -I$(CURDIR)/src \
+		$(CURDIR)/tests/test_unit.c $(CURDIR)/src/cache_writer.c \
+		$(BUILD_DIR)/host/librcheevos.a -lm -lpthread -o $(TEST_BIN)
+	$(TEST_BIN)
 
 $(BUILD_DIR)/bin/h700/minui-list:
 	@mkdir -p $(dir $@)

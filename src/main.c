@@ -1403,6 +1403,79 @@ static bool collect_roms_from_json(const SyncOptions* opts, RomList* list, bool*
 	return true;
 }
 
+static int clear_unrecognized_cache(const char* userdata_dir) {
+	char cache_dir[CACHE_MAX_PATH];
+	if (snprintf(cache_dir, sizeof(cache_dir), "%s/.ra/offline/cache", userdata_dir) >= (int)sizeof(cache_dir)) {
+		fprintf(stderr, "Error: cache path too long\n");
+		return 1;
+	}
+
+	DIR* dir = opendir(cache_dir);
+	if (!dir) {
+		if (errno == ENOENT) {
+			printf("No unrecognized game cache entries found\n");
+			return 0;
+		}
+		fprintf(stderr, "Error: cannot open cache directory %s: %s\n", cache_dir, strerror(errno));
+		return 1;
+	}
+
+	size_t cleared = 0;
+	struct dirent* ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.') {
+			continue;
+		}
+		if (strncmp(ent->d_name, "achievementsets_", 16) != 0 ||
+		    !has_suffix(ent->d_name, ".bin")) {
+			continue;
+		}
+
+		char full_path[CACHE_MAX_PATH];
+		if (snprintf(full_path, sizeof(full_path), "%s/%s", cache_dir, ent->d_name) >= (int)sizeof(full_path)) {
+			continue;
+		}
+
+		struct stat st;
+		if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+			continue;
+		}
+
+		char* body = NULL;
+		size_t body_len = 0;
+		if (!cache_read_file(full_path, &body, &body_len)) {
+			continue;
+		}
+
+		rc_api_server_response_t srv = {
+			.body = body,
+			.body_length = body_len,
+			.http_status_code = HTTP_STATUS_OK
+		};
+		rc_api_fetch_game_sets_response_t sets;
+		int rc = rc_api_process_fetch_game_sets_server_response(&sets, &srv);
+		free(body);
+
+		if (rc == RC_OK && sets.response.succeeded && sets.id == 0) {
+			if (unlink(full_path) == 0) {
+				cleared++;
+			} else {
+				fprintf(stderr, "Warning: failed to remove %s: %s\n", full_path, strerror(errno));
+			}
+		}
+		rc_api_destroy_fetch_game_sets_response(&sets);
+	}
+
+	closedir(dir);
+
+	if (cleared == 0) {
+		printf("No unrecognized game cache entries found\n");
+	} else {
+		printf("Cleared %zu unrecognized game cache entries\n", cleared);
+	}
+	return 0;
+}
+
 static void normalize_folder_arg(const char* src, char* dst, size_t dst_sz) {
 	copy_str_bounded(dst, dst_sz, src);
 	size_t len = strlen(dst);
@@ -1416,6 +1489,7 @@ static void print_usage(const char* prog) {
 	       "  --status                   Print RA login and cache status (exit 2 if not logged in)\n"
 	       "  --list-systems             List supported ROM folders (<folder>\\t<tag>\\t<count>)\n"
 	       "  --list-games-json <dir>    Print minui-list JSON for ROMs in <dir>\n"
+	       "  --clear-unrecognized       Remove cached achievementsets for unrecognized games\n"
 	       "  --system <dir>             Limit sync to a single ROM folder under --roms\n"
 	       "  --sync-json <path>         Sync only games with selected=1 in <path> (requires --system)\n"
 	       "  --userdata <dir>           Shared userdata dir (default: $SHARED_USERDATA_PATH or %s)\n"
@@ -1431,7 +1505,8 @@ static void print_usage(const char* prog) {
 }
 
 static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mode,
-                       bool* list_systems_mode, char* list_games_buf, size_t list_games_sz,
+                       bool* list_systems_mode, bool* clear_unrecognized_mode,
+                       char* list_games_buf, size_t list_games_sz,
                        char* system_buf, size_t system_sz,
                        char* default_roms_buf, size_t roms_buf_sz) {
 	const char* env_userdata = getenv("SHARED_USERDATA_PATH");
@@ -1454,6 +1529,7 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 	opts->refresh_sessions = false;
 	*status_mode = false;
 	*list_systems_mode = false;
+	*clear_unrecognized_mode = false;
 	list_games_buf[0] = '\0';
 	system_buf[0] = '\0';
 
@@ -1462,6 +1538,8 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 			*status_mode = true;
 		} else if (strcmp(argv[i], "--list-systems") == 0) {
 			*list_systems_mode = true;
+		} else if (strcmp(argv[i], "--clear-unrecognized") == 0) {
+			*clear_unrecognized_mode = true;
 		} else if (strcmp(argv[i], "--list-games-json") == 0 && i + 1 < argc) {
 			normalize_folder_arg(argv[++i], list_games_buf, list_games_sz);
 		} else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
@@ -1660,7 +1738,8 @@ int main(int argc, char** argv) {
 	SyncOptions opts;
 	bool status_mode = false;
 	bool list_systems_mode = false;
-	if (!parse_args(argc, argv, &opts, &status_mode, &list_systems_mode,
+	bool clear_unrecognized_mode = false;
+	if (!parse_args(argc, argv, &opts, &status_mode, &list_systems_mode, &clear_unrecognized_mode,
 	                list_games_buf, sizeof(list_games_buf),
 	                system_buf, sizeof(system_buf),
 	                default_roms_buf, sizeof(default_roms_buf))) {
@@ -1675,6 +1754,9 @@ int main(int argc, char** argv) {
 	}
 	if (list_games_buf[0] != '\0') {
 		return list_games_json(&opts, list_games_buf);
+	}
+	if (clear_unrecognized_mode) {
+		return clear_unrecognized_cache(opts.userdata_dir);
 	}
 
 	RunStats stats;

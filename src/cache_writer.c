@@ -2,15 +2,19 @@
 #include "cache_writer.h"
 
 #include <errno.h>
+#ifndef CACHE_WRITER_NO_CRYPTO
 #include <openssl/evp.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef CACHE_WRITER_NO_CRYPTO
 #define CACHE_SHA256_SIZE 32
 #define CACHE_MAX_BODY_SIZE (8u * 1024u * 1024u)
+#endif
 #define INDEX_INITIAL_CAP 256
 #define DIR_MODE 0755
 
@@ -67,6 +71,7 @@ void cache_index_path(const char* userdata_dir, char* out, size_t out_size) {
 	snprintf(out, out_size, "%s/.ra/offline/scraper_index.tsv", userdata_dir);
 }
 
+#ifndef CACHE_WRITER_NO_CRYPTO
 bool cache_write_file(const char* path, const char* body, size_t len) {
 	if (!path || !body || len > CACHE_MAX_BODY_SIZE) {
 		return false;
@@ -160,12 +165,14 @@ bool cache_read_file(const char* path, char** out_body, size_t* out_len) {
 bool cache_verify_file(const char* path) {
 	return cache_read_file(path, NULL, NULL);
 }
+#endif
 
 bool cache_file_exists_nonempty(const char* path) {
 	struct stat st;
 	return stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
 }
 
+#ifndef CACHE_WRITER_NO_CRYPTO
 bool cache_has_valid_game(const char* userdata_dir, const char* game_hash) {
 	if (!userdata_dir || !game_hash || !*game_hash) {
 		return false;
@@ -174,6 +181,7 @@ bool cache_has_valid_game(const char* userdata_dir, const char* game_hash) {
 	cache_achievementsets_path(userdata_dir, game_hash, ach_path, sizeof(ach_path));
 	return cache_verify_file(ach_path);
 }
+#endif
 
 void scraper_index_init(ScraperIndex* idx) {
 	memset(idx, 0, sizeof(*idx));
