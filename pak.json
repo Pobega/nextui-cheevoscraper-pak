@@ -1,0 +1,13 @@
+{
+  "name": "RA Cache",
+  "type": "TOOL",
+  "description": "Pre-downloads RetroAchievements cache and badges for offline play on NextUI",
+  "author": "Pobega",
+  "release_filename": "RA Cache.pak.zip",
+  "platforms": [
+    "tg5040",
+    "h700"
+  ],
+  "launch": "launch.sh",
+  "version": "0.1.0"
+}
