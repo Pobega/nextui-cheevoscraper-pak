@@ -166,6 +166,15 @@ bool cache_file_exists_nonempty(const char* path) {
 	return stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
 }
 
+bool cache_has_valid_game(const char* userdata_dir, const char* game_hash) {
+	if (!userdata_dir || !game_hash || !*game_hash) {
+		return false;
+	}
+	char ach_path[CACHE_MAX_PATH];
+	cache_achievementsets_path(userdata_dir, game_hash, ach_path, sizeof(ach_path));
+	return cache_verify_file(ach_path);
+}
+
 void scraper_index_init(ScraperIndex* idx) {
 	memset(idx, 0, sizeof(*idx));
 }

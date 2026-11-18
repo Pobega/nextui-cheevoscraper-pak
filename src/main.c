@@ -5,6 +5,7 @@
 #include "ra_consoles.h"
 #include "rom_hasher.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,11 +28,14 @@
 #define PROGRESS_COMPLETE 100
 #define SETTINGS_STR_MAX 256
 #define INITIAL_LIST_CAP 64
+#define JSON_FILE_MAX_BYTES (16u * 1024u * 1024u)
 
 typedef struct {
 	const char* userdata_dir;
 	const char* roms_dir;
 	const char* fifo_path;
+	const char* system_folder;
+	const char* sync_json_path;
 	int delay_ms;
 	int limit;
 	bool dry_run;
@@ -251,9 +255,9 @@ static void rom_list_free(RomList* list) {
 	memset(list, 0, sizeof(*list));
 }
 
-static void scan_console_dir(const char* dir_path, const char* rel_prefix,
-                             int console_id, int limit, RomList* list) {
-	if (limit > 0 && list->count >= (size_t)limit) {
+static void walk_console_dir(const char* dir_path, const char* rel_prefix,
+                             int console_id, int limit, RomList* list, size_t* count) {
+	if (list && limit > 0 && list->count >= (size_t)limit) {
 		return;
 	}
 
@@ -264,7 +268,7 @@ static void scan_console_dir(const char* dir_path, const char* rel_prefix,
 
 	struct dirent* ent;
 	while ((ent = readdir(dir)) != NULL) {
-		if (limit > 0 && list->count >= (size_t)limit) {
+		if (list && limit > 0 && list->count >= (size_t)limit) {
 			break;
 		}
 		if (ent->d_name[0] == '.') {
@@ -284,10 +288,15 @@ static void scan_console_dir(const char* dir_path, const char* rel_prefix,
 		}
 
 		if (S_ISDIR(st.st_mode)) {
-			scan_console_dir(abs_path, rel_path, console_id, limit, list);
+			walk_console_dir(abs_path, rel_path, console_id, limit, list, count);
 		} else if (S_ISREG(st.st_mode)) {
 			if (!rom_should_skip(abs_path, dir_path, ent->d_name)) {
-				rom_list_push(list, abs_path, rel_path, console_id, st.st_mtime, (int64_t)st.st_size);
+				if (list) {
+					rom_list_push(list, abs_path, rel_path, console_id, st.st_mtime, (int64_t)st.st_size);
+				}
+				if (count) {
+					(*count)++;
+				}
 			}
 		}
 	}
@@ -295,11 +304,48 @@ static void scan_console_dir(const char* dir_path, const char* rel_prefix,
 	closedir(dir);
 }
 
-static void collect_roms(const char* roms_dir, int limit, RomList* list) {
+static bool resolve_system_folder(const char* roms_dir, const char* folder_name,
+                                  char* out_path, size_t out_size, int* out_console_id) {
+	if (!folder_name || !*folder_name) {
+		return false;
+	}
+	if (snprintf(out_path, out_size, "%s/%s", roms_dir, folder_name) >= (int)out_size) {
+		return false;
+	}
+
+	struct stat st;
+	if (stat(out_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "Error: system folder not found: %s\n", out_path);
+		return false;
+	}
+
+	char emu_tag[64];
+	ra_extract_emu_tag(folder_name, emu_tag, sizeof(emu_tag));
+	int console_id = ra_get_console_id(emu_tag);
+	if (console_id == RC_CONSOLE_UNKNOWN) {
+		fprintf(stderr, "Error: unsupported console tag '%s' for folder '%s'\n", emu_tag, folder_name);
+		return false;
+	}
+
+	*out_console_id = console_id;
+	return true;
+}
+
+static bool collect_roms(const char* roms_dir, const char* system_folder, int limit, RomList* list) {
+	if (system_folder && *system_folder) {
+		char folder_path[CACHE_MAX_PATH];
+		int console_id = RC_CONSOLE_UNKNOWN;
+		if (!resolve_system_folder(roms_dir, system_folder, folder_path, sizeof(folder_path), &console_id)) {
+			return false;
+		}
+		walk_console_dir(folder_path, system_folder, console_id, limit, list, NULL);
+		return true;
+	}
+
 	DIR* root = opendir(roms_dir);
 	if (!root) {
 		fprintf(stderr, "Error: cannot open ROMs directory: %s (%s)\n", roms_dir, strerror(errno));
-		return;
+		return false;
 	}
 
 	struct dirent* ent;
@@ -328,10 +374,11 @@ static void collect_roms(const char* roms_dir, int limit, RomList* list) {
 			continue;
 		}
 
-		scan_console_dir(folder_path, ent->d_name, console_id, limit, list);
+		walk_console_dir(folder_path, ent->d_name, console_id, limit, list, NULL);
 	}
 
 	closedir(root);
+	return true;
 }
 
 static const char* basename_ptr(const char* path) {
@@ -720,22 +767,672 @@ static void cache_game_badges(const SyncOptions* opts, HttpClient* http,
 	}
 }
 
+typedef struct {
+	char* folder_name;
+	char tag[64];
+	size_t count;
+} SystemEntry;
+
+static int system_entry_cmp(const void* a, const void* b) {
+	const SystemEntry* sa = (const SystemEntry*)a;
+	const SystemEntry* sb = (const SystemEntry*)b;
+	return strcmp(sa->folder_name, sb->folder_name);
+}
+
+static int rom_entry_cmp(const void* a, const void* b) {
+	const RomEntry* ra = (const RomEntry*)a;
+	const RomEntry* rb = (const RomEntry*)b;
+	return strcmp(ra->rel_path, rb->rel_path);
+}
+
+static void print_json_escaped(FILE* out, const char* s) {
+	for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+		unsigned char c = *p;
+		switch (c) {
+			case '\\': fputs("\\\\", out); break;
+			case '"':  fputs("\\\"", out); break;
+			case '\b': fputs("\\b", out); break;
+			case '\f': fputs("\\f", out); break;
+			case '\n': fputs("\\n", out); break;
+			case '\r': fputs("\\r", out); break;
+			case '\t': fputs("\\t", out); break;
+			default:
+				if (c < 0x20) {
+					fprintf(out, "\\u%04x", (unsigned int)c);
+				} else {
+					fputc((int)c, out);
+				}
+				break;
+		}
+	}
+}
+
+static int list_systems(const SyncOptions* opts) {
+	DIR* root = opendir(opts->roms_dir);
+	if (!root) {
+		fprintf(stderr, "Error: cannot open ROMs directory: %s (%s)\n", opts->roms_dir, strerror(errno));
+		return 1;
+	}
+
+	SystemEntry* entries = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+
+	struct dirent* ent;
+	while ((ent = readdir(root)) != NULL) {
+		if (ent->d_name[0] == '.') {
+			continue;
+		}
+
+		char folder_path[CACHE_MAX_PATH];
+		if (snprintf(folder_path, sizeof(folder_path), "%s/%s", opts->roms_dir, ent->d_name) >= (int)sizeof(folder_path)) {
+			continue;
+		}
+
+		struct stat st;
+		if (stat(folder_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+			continue;
+		}
+
+		char emu_tag[64];
+		ra_extract_emu_tag(ent->d_name, emu_tag, sizeof(emu_tag));
+		int console_id = ra_get_console_id(emu_tag);
+		if (console_id == RC_CONSOLE_UNKNOWN) {
+			continue;
+		}
+
+		size_t rom_count = 0;
+		walk_console_dir(folder_path, ent->d_name, console_id, 0, NULL, &rom_count);
+		if (rom_count == 0) {
+			continue;
+		}
+
+		if (count == cap) {
+			size_t new_cap = cap ? cap * 2 : 32;
+			SystemEntry* grown = realloc(entries, new_cap * sizeof(*grown));
+			if (!grown) {
+				for (size_t i = 0; i < count; i++) {
+					free(entries[i].folder_name);
+				}
+				free(entries);
+				closedir(root);
+				return 1;
+			}
+			entries = grown;
+			cap = new_cap;
+		}
+
+		entries[count].folder_name = strdup(ent->d_name);
+		if (!entries[count].folder_name) {
+			continue;
+		}
+		copy_str_bounded(entries[count].tag, sizeof(entries[count].tag), emu_tag);
+		entries[count].count = rom_count;
+		count++;
+	}
+
+	closedir(root);
+
+	if (count > 1) {
+		qsort(entries, count, sizeof(*entries), system_entry_cmp);
+	}
+
+	for (size_t i = 0; i < count; i++) {
+		printf("%s\t%s\t%zu\n", entries[i].folder_name, entries[i].tag, entries[i].count);
+		free(entries[i].folder_name);
+	}
+	free(entries);
+	return 0;
+}
+
+static int list_games_json(const SyncOptions* opts, const char* folder_name) {
+	char folder_path[CACHE_MAX_PATH];
+	int console_id = RC_CONSOLE_UNKNOWN;
+	if (!resolve_system_folder(opts->roms_dir, folder_name, folder_path, sizeof(folder_path), &console_id)) {
+		return 1;
+	}
+
+	RomList roms = {0};
+	walk_console_dir(folder_path, folder_name, console_id, 0, &roms, NULL);
+	if (roms.count > 1) {
+		qsort(roms.items, roms.count, sizeof(*roms.items), rom_entry_cmp);
+	}
+
+	ScraperIndex index;
+	scraper_index_init(&index);
+	char index_path[CACHE_MAX_PATH];
+	cache_index_path(opts->userdata_dir, index_path, sizeof(index_path));
+	scraper_index_load(&index, index_path);
+
+	size_t prefix_len = strlen(folder_name) + 1;
+	fputs("{\"games\":[", stdout);
+	for (size_t i = 0; i < roms.count; i++) {
+		const RomEntry* rom = &roms.items[i];
+		const char* sub_rel = (strlen(rom->rel_path) > prefix_len)
+			? (rom->rel_path + prefix_len)
+			: rom->rel_path;
+
+		const char* hash = scraper_index_lookup(&index, rom->rel_path, rom->console_id, rom->mtime, rom->size);
+		bool cached = hash && cache_has_valid_game(opts->userdata_dir, hash);
+
+		if (i > 0) {
+			fputc(',', stdout);
+		}
+		fputs("{\"name\":\"", stdout);
+		print_json_escaped(stdout, sub_rel);
+		if (cached) {
+			fputs("\",\"options\":[\"Skip (Cached)\",\"Sync\"],\"selected\":0}", stdout);
+		} else {
+			fputs("\",\"options\":[\"Skip\",\"Sync\"],\"selected\":0}", stdout);
+		}
+	}
+	fputs("]}\n", stdout);
+	fflush(stdout);
+
+	scraper_index_free(&index);
+	rom_list_free(&roms);
+	return 0;
+}
+
+static void json_skip_ws(const char** p) {
+	while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') {
+		(*p)++;
+	}
+}
+
+static bool json_parse_hex4(const char* p, uint32_t* out) {
+	uint32_t val = 0;
+	for (int i = 0; i < 4; i++) {
+		unsigned char c = (unsigned char)p[i];
+		if (!isxdigit(c)) {
+			return false;
+		}
+		val <<= 4;
+		if (c >= '0' && c <= '9') {
+			val |= (uint32_t)(c - '0');
+		} else if (c >= 'a' && c <= 'f') {
+			val |= (uint32_t)(c - 'a' + 10);
+		} else {
+			val |= (uint32_t)(c - 'A' + 10);
+		}
+	}
+	*out = val;
+	return true;
+}
+
+static bool json_append_utf8(char** buf, size_t* len, size_t* cap, uint32_t cp) {
+	char tmp[4];
+	size_t n = 0;
+	if (cp <= 0x7F) {
+		tmp[0] = (char)cp;
+		n = 1;
+	} else if (cp <= 0x7FF) {
+		tmp[0] = (char)(0xC0 | (cp >> 6));
+		tmp[1] = (char)(0x80 | (cp & 0x3F));
+		n = 2;
+	} else if (cp <= 0xFFFF) {
+		tmp[0] = (char)(0xE0 | (cp >> 12));
+		tmp[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+		tmp[2] = (char)(0x80 | (cp & 0x3F));
+		n = 3;
+	} else if (cp <= 0x10FFFF) {
+		tmp[0] = (char)(0xF0 | (cp >> 18));
+		tmp[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+		tmp[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+		tmp[3] = (char)(0x80 | (cp & 0x3F));
+		n = 4;
+	} else {
+		return false;
+	}
+
+	if (*len + n + 1 > *cap) {
+		size_t new_cap = (*cap == 0) ? 256 : (*cap * 2);
+		while (new_cap < *len + n + 1) {
+			new_cap *= 2;
+		}
+		char* grown = realloc(*buf, new_cap);
+		if (!grown) {
+			return false;
+		}
+		*buf = grown;
+		*cap = new_cap;
+	}
+
+	memcpy(*buf + *len, tmp, n);
+	*len += n;
+	(*buf)[*len] = '\0';
+	return true;
+}
+
+static bool json_parse_string(const char** p, char** out) {
+	if (**p != '"') {
+		return false;
+	}
+	(*p)++;
+
+	char* buf = NULL;
+	size_t len = 0;
+	size_t cap = 0;
+	if (!json_append_utf8(&buf, &len, &cap, 0)) {
+		return false;
+	}
+	len = 0;
+	buf[0] = '\0';
+
+	while (**p != '\0' && **p != '"') {
+		unsigned char c = (unsigned char)**p;
+		(*p)++;
+		if (c == '\\') {
+			char esc = **p;
+			if (!esc) {
+				free(buf);
+				return false;
+			}
+			(*p)++;
+			uint32_t cp = 0;
+			switch (esc) {
+				case '"':  cp = '"'; break;
+				case '\\': cp = '\\'; break;
+				case '/':  cp = '/'; break;
+				case 'b':  cp = '\b'; break;
+				case 'f':  cp = '\f'; break;
+				case 'n':  cp = '\n'; break;
+				case 'r':  cp = '\r'; break;
+				case 't':  cp = '\t'; break;
+				case 'u': {
+					if (!json_parse_hex4(*p, &cp)) {
+						free(buf);
+						return false;
+					}
+					*p += 4;
+					if (cp >= 0xD800 && cp <= 0xDBFF && (*p)[0] == '\\' && (*p)[1] == 'u') {
+						uint32_t low = 0;
+						if (json_parse_hex4(*p + 2, &low) && low >= 0xDC00 && low <= 0xDFFF) {
+							cp = 0x10000u + (((cp - 0xD800u) << 10) | (low - 0xDC00u));
+							*p += 6;
+						}
+					}
+					break;
+				}
+				default:
+					free(buf);
+					return false;
+			}
+			if (!json_append_utf8(&buf, &len, &cap, cp)) {
+				free(buf);
+				return false;
+			}
+		} else {
+			if (!json_append_utf8(&buf, &len, &cap, c)) {
+				free(buf);
+				return false;
+			}
+		}
+	}
+
+	if (**p != '"') {
+		free(buf);
+		return false;
+	}
+	(*p)++;
+	*out = buf;
+	return true;
+}
+
+static bool json_skip_value(const char** p);
+
+static bool json_skip_string(const char** p) {
+	if (**p != '"') {
+		return false;
+	}
+	(*p)++;
+	while (**p != '\0' && **p != '"') {
+		if (**p == '\\') {
+			(*p)++;
+			if (**p == '\0') {
+				return false;
+			}
+		}
+		(*p)++;
+	}
+	if (**p != '"') {
+		return false;
+	}
+	(*p)++;
+	return true;
+}
+
+static bool json_skip_value(const char** p) {
+	json_skip_ws(p);
+	char c = **p;
+	if (c == '"') {
+		return json_skip_string(p);
+	}
+	if (c == '{') {
+		(*p)++;
+		json_skip_ws(p);
+		if (**p == '}') {
+			(*p)++;
+			return true;
+		}
+		while (**p != '\0') {
+			json_skip_ws(p);
+			if (!json_skip_string(p)) {
+				return false;
+			}
+			json_skip_ws(p);
+			if (**p != ':') {
+				return false;
+			}
+			(*p)++;
+			if (!json_skip_value(p)) {
+				return false;
+			}
+			json_skip_ws(p);
+			if (**p == ',') {
+				(*p)++;
+			} else if (**p == '}') {
+				(*p)++;
+				return true;
+			} else {
+				return false;
+			}
+		}
+		return false;
+	}
+	if (c == '[') {
+		(*p)++;
+		json_skip_ws(p);
+		if (**p == ']') {
+			(*p)++;
+			return true;
+		}
+		while (**p != '\0') {
+			if (!json_skip_value(p)) {
+				return false;
+			}
+			json_skip_ws(p);
+			if (**p == ',') {
+				(*p)++;
+			} else if (**p == ']') {
+				(*p)++;
+				return true;
+			} else {
+				return false;
+			}
+		}
+		return false;
+	}
+	if (c == '\0') {
+		return false;
+	}
+	while (**p != '\0' && **p != ',' && **p != ']' && **p != '}' &&
+	       **p != ' ' && **p != '\t' && **p != '\n' && **p != '\r') {
+		(*p)++;
+	}
+	return true;
+}
+
+static bool json_parse_game_object(const char** p, StringSet* out_names) {
+	json_skip_ws(p);
+	if (**p != '{') {
+		return false;
+	}
+	(*p)++;
+	json_skip_ws(p);
+	if (**p == '}') {
+		(*p)++;
+		return true;
+	}
+
+	char* name = NULL;
+	bool selected = false;
+
+	while (**p != '\0') {
+		json_skip_ws(p);
+		char* key = NULL;
+		if (!json_parse_string(p, &key)) {
+			free(name);
+			return false;
+		}
+		json_skip_ws(p);
+		if (**p != ':') {
+			free(key);
+			free(name);
+			return false;
+		}
+		(*p)++;
+		json_skip_ws(p);
+
+		if (strcmp(key, "name") == 0 && **p == '"') {
+			free(name);
+			name = NULL;
+			if (!json_parse_string(p, &name)) {
+				free(key);
+				return false;
+			}
+		} else if (strcmp(key, "selected") == 0) {
+			if (**p == '-' || isdigit((unsigned char)**p)) {
+				char* end = NULL;
+				long val = strtol(*p, &end, 10);
+				*p = end;
+				selected = (val == 1);
+			} else if (strncmp(*p, "true", 4) == 0) {
+				*p += 4;
+				selected = true;
+			} else if (!json_skip_value(p)) {
+				free(key);
+				free(name);
+				return false;
+			}
+		} else if (!json_skip_value(p)) {
+			free(key);
+			free(name);
+			return false;
+		}
+		free(key);
+
+		json_skip_ws(p);
+		if (**p == ',') {
+			(*p)++;
+		} else if (**p == '}') {
+			(*p)++;
+			if (selected && name && *name) {
+				string_set_insert(out_names, name);
+			}
+			free(name);
+			return true;
+		} else {
+			free(name);
+			return false;
+		}
+	}
+
+	free(name);
+	return false;
+}
+
+static bool parse_selected_games_json(const char* json_path, StringSet* out_names) {
+	FILE* f = fopen(json_path, "rb");
+	if (!f) {
+		fprintf(stderr, "Error: cannot open JSON file %s: %s\n", json_path, strerror(errno));
+		return false;
+	}
+
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return false;
+	}
+	long fsize = ftell(f);
+	if (fsize < 0 || (unsigned long)fsize > JSON_FILE_MAX_BYTES || fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return false;
+	}
+
+	char* buf = malloc((size_t)fsize + 1);
+	if (!buf) {
+		fclose(f);
+		return false;
+	}
+	size_t nread = fread(buf, 1, (size_t)fsize, f);
+	fclose(f);
+	buf[nread] = '\0';
+
+	const char* p = buf;
+	json_skip_ws(&p);
+	if (*p != '{') {
+		free(buf);
+		return false;
+	}
+	p++;
+	json_skip_ws(&p);
+	if (*p == '}') {
+		free(buf);
+		return true;
+	}
+
+	bool ok = true;
+	while (*p != '\0') {
+		json_skip_ws(&p);
+		char* key = NULL;
+		if (!json_parse_string(&p, &key)) {
+			ok = false;
+			break;
+		}
+		json_skip_ws(&p);
+		if (*p != ':') {
+			free(key);
+			ok = false;
+			break;
+		}
+		p++;
+		json_skip_ws(&p);
+
+		if (strcmp(key, "games") == 0 && *p == '[') {
+			p++;
+			json_skip_ws(&p);
+			if (*p != ']') {
+				while (*p != '\0') {
+					if (!json_parse_game_object(&p, out_names)) {
+						ok = false;
+						break;
+					}
+					json_skip_ws(&p);
+					if (*p == ',') {
+						p++;
+					} else if (*p == ']') {
+						p++;
+						break;
+					} else {
+						ok = false;
+						break;
+					}
+				}
+			} else {
+				p++;
+			}
+		} else if (!json_skip_value(&p)) {
+			ok = false;
+		}
+		free(key);
+
+		if (!ok) {
+			break;
+		}
+		json_skip_ws(&p);
+		if (*p == ',') {
+			p++;
+		} else if (*p == '}') {
+			p++;
+			break;
+		} else {
+			ok = false;
+			break;
+		}
+	}
+
+	free(buf);
+	return ok;
+}
+
+static bool collect_roms_from_json(const SyncOptions* opts, RomList* list, bool* out_empty) {
+	*out_empty = false;
+
+	char folder_path[CACHE_MAX_PATH];
+	int console_id = RC_CONSOLE_UNKNOWN;
+	if (!resolve_system_folder(opts->roms_dir, opts->system_folder, folder_path, sizeof(folder_path), &console_id)) {
+		return false;
+	}
+
+	StringSet selected = {0};
+	if (!parse_selected_games_json(opts->sync_json_path, &selected)) {
+		fprintf(stderr, "Error: failed to parse selected games from %s\n", opts->sync_json_path);
+		string_set_free(&selected);
+		return false;
+	}
+
+	if (selected.count == 0) {
+		*out_empty = true;
+		string_set_free(&selected);
+		return true;
+	}
+
+	for (size_t i = 0; i < selected.count; i++) {
+		if (opts->limit > 0 && list->count >= (size_t)opts->limit) {
+			break;
+		}
+
+		const char* sub_rel = selected.names[i];
+		char abs_path[CACHE_MAX_PATH];
+		char rel_path[CACHE_MAX_PATH];
+		if (snprintf(abs_path, sizeof(abs_path), "%s/%s", folder_path, sub_rel) >= (int)sizeof(abs_path) ||
+		    snprintf(rel_path, sizeof(rel_path), "%s/%s", opts->system_folder, sub_rel) >= (int)sizeof(rel_path)) {
+			continue;
+		}
+
+		struct stat st;
+		if (stat(abs_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+			fprintf(stderr, "Warning: selected ROM not found: %s\n", abs_path);
+			continue;
+		}
+
+		rom_list_push(list, abs_path, rel_path, console_id, st.st_mtime, (int64_t)st.st_size);
+	}
+
+	string_set_free(&selected);
+	return true;
+}
+
+static void normalize_folder_arg(const char* src, char* dst, size_t dst_sz) {
+	copy_str_bounded(dst, dst_sz, src);
+	size_t len = strlen(dst);
+	while (len > 1 && dst[len - 1] == '/') {
+		dst[--len] = '\0';
+	}
+}
+
 static void print_usage(const char* prog) {
 	printf("Usage: %s [options]\n"
-	       "  --status             Print RA login and cache status (exit 2 if not logged in)\n"
-	       "  --userdata <dir>     Shared userdata dir (default: $SHARED_USERDATA_PATH or %s)\n"
-	       "  --roms <dir>         ROMs root dir (default: $SDCARD_PATH/Roms or %s)\n"
-	       "  --fifo <path>        FIFO path for show2.elf TEXT/PROGRESS updates\n"
-	       "  --delay-ms <ms>      Delay between HTTP requests (default: %d)\n"
-	       "  --limit <n>          Maximum ROMs to scan\n"
-	       "  --dry-run            Scan and hash only; do not write cache or hit network\n"
-	       "  --force              Re-hash ROMs and re-fetch existing cache files\n"
-	       "  --refresh-sessions   Re-fetch startsession cache files for all matched games\n"
-	       "  --help               Show this help message\n",
+	       "  --status                   Print RA login and cache status (exit 2 if not logged in)\n"
+	       "  --list-systems             List supported ROM folders (<folder>\\t<tag>\\t<count>)\n"
+	       "  --list-games-json <dir>    Print minui-list JSON for ROMs in <dir>\n"
+	       "  --system <dir>             Limit sync to a single ROM folder under --roms\n"
+	       "  --sync-json <path>         Sync only games with selected=1 in <path> (requires --system)\n"
+	       "  --userdata <dir>           Shared userdata dir (default: $SHARED_USERDATA_PATH or %s)\n"
+	       "  --roms <dir>               ROMs root dir (default: $SDCARD_PATH/Roms or %s)\n"
+	       "  --fifo <path>              FIFO path for show2.elf TEXT/PROGRESS updates\n"
+	       "  --delay-ms <ms>            Delay between HTTP requests (default: %d)\n"
+	       "  --limit <n>                Maximum ROMs to scan\n"
+	       "  --dry-run                  Scan and hash only; do not write cache or hit network\n"
+	       "  --force                    Re-hash ROMs and re-fetch existing cache files\n"
+	       "  --refresh-sessions         Re-fetch startsession cache files for all matched games\n"
+	       "  --help                     Show this help message\n",
 	       prog, DEFAULT_USERDATA_PATH, DEFAULT_ROMS_PATH, HTTP_DEFAULT_DELAY_MS);
 }
 
 static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mode,
+                       bool* list_systems_mode, char* list_games_buf, size_t list_games_sz,
+                       char* system_buf, size_t system_sz,
                        char* default_roms_buf, size_t roms_buf_sz) {
 	const char* env_userdata = getenv("SHARED_USERDATA_PATH");
 	const char* env_sdcard = getenv("SDCARD_PATH");
@@ -748,16 +1445,30 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 		opts->roms_dir = DEFAULT_ROMS_PATH;
 	}
 	opts->fifo_path = NULL;
+	opts->system_folder = NULL;
+	opts->sync_json_path = NULL;
 	opts->delay_ms = HTTP_DEFAULT_DELAY_MS;
 	opts->limit = 0;
 	opts->dry_run = false;
 	opts->force = false;
 	opts->refresh_sessions = false;
 	*status_mode = false;
+	*list_systems_mode = false;
+	list_games_buf[0] = '\0';
+	system_buf[0] = '\0';
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--status") == 0) {
 			*status_mode = true;
+		} else if (strcmp(argv[i], "--list-systems") == 0) {
+			*list_systems_mode = true;
+		} else if (strcmp(argv[i], "--list-games-json") == 0 && i + 1 < argc) {
+			normalize_folder_arg(argv[++i], list_games_buf, list_games_sz);
+		} else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
+			normalize_folder_arg(argv[++i], system_buf, system_sz);
+			opts->system_folder = system_buf;
+		} else if (strcmp(argv[i], "--sync-json") == 0 && i + 1 < argc) {
+			opts->sync_json_path = argv[++i];
 		} else if (strcmp(argv[i], "--userdata") == 0 && i + 1 < argc) {
 			opts->userdata_dir = argv[++i];
 		} else if (strcmp(argv[i], "--roms") == 0 && i + 1 < argc) {
@@ -783,26 +1494,51 @@ static bool parse_args(int argc, char** argv, SyncOptions* opts, bool* status_mo
 			return false;
 		}
 	}
+
+	if (opts->sync_json_path && (!opts->system_folder || !*opts->system_folder)) {
+		fprintf(stderr, "Error: --sync-json requires --system <folder_name>\n");
+		return false;
+	}
 	return true;
 }
 
 static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 	memset(out_stats, 0, sizeof(*out_stats));
 
+	RomList roms = {0};
+	if (opts->sync_json_path) {
+		bool json_empty = false;
+		if (!collect_roms_from_json(opts, &roms, &json_empty)) {
+			ui_status(opts, -1, "Failed to read selected games");
+			rom_list_free(&roms);
+			return false;
+		}
+		if (json_empty) {
+			ui_status(opts, PROGRESS_COMPLETE, "No games selected");
+			printf("SUMMARY: Scanned 0 | Matched 0 | Cached 0 | Badges 0 | Errors 0\n");
+			fflush(stdout);
+			rom_list_free(&roms);
+			return true;
+		}
+	}
+
 	RASettings settings;
 	if (!load_ra_settings(opts->userdata_dir, &settings)) {
 		ui_status(opts, -1, "Missing NextUI settings file");
+		rom_list_free(&roms);
 		return false;
 	}
 
 	const char* username = effective_username(&settings);
 	if (!*username || !*settings.token) {
 		ui_status(opts, -1, "No RetroAchievements login in NextUI settings");
+		rom_list_free(&roms);
 		return false;
 	}
 
 	if (!opts->dry_run && !ensure_cache_dirs(opts->userdata_dir)) {
 		ui_status(opts, -1, "Failed to create .ra cache directories");
+		rom_list_free(&roms);
 		return false;
 	}
 
@@ -812,18 +1548,24 @@ static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 	ui_status(opts, 0, "Verifying RetroAchievements login...");
 	if (!perform_login(opts, &http, username, settings.token)) {
 		ui_status(opts, -1, "RetroAchievements login failed");
+		rom_list_free(&roms);
 		return false;
 	}
 
-	ui_status(opts, 5, "Scanning ROM folders...");
-	RomList roms = {0};
-	collect_roms(opts->roms_dir, opts->limit, &roms);
+	if (!opts->sync_json_path) {
+		ui_status(opts, 5, "Scanning ROM folders...");
+		if (!collect_roms(opts->roms_dir, opts->system_folder, opts->limit, &roms)) {
+			ui_status(opts, -1, "Failed to scan ROM folders");
+			rom_list_free(&roms);
+			return false;
+		}
+	}
 
 	ScraperIndex index;
 	scraper_index_init(&index);
 	char index_path[CACHE_MAX_PATH];
 	cache_index_path(opts->userdata_dir, index_path, sizeof(index_path));
-	if (!opts->force) {
+	if (!opts->force || opts->system_folder || opts->sync_json_path) {
 		scraper_index_load(&index, index_path);
 	}
 
@@ -913,14 +1655,26 @@ static bool run_sync(const SyncOptions* opts, RunStats* out_stats) {
 
 int main(int argc, char** argv) {
 	char default_roms_buf[CACHE_MAX_PATH];
+	char list_games_buf[CACHE_MAX_PATH];
+	char system_buf[CACHE_MAX_PATH];
 	SyncOptions opts;
 	bool status_mode = false;
-	if (!parse_args(argc, argv, &opts, &status_mode, default_roms_buf, sizeof(default_roms_buf))) {
+	bool list_systems_mode = false;
+	if (!parse_args(argc, argv, &opts, &status_mode, &list_systems_mode,
+	                list_games_buf, sizeof(list_games_buf),
+	                system_buf, sizeof(system_buf),
+	                default_roms_buf, sizeof(default_roms_buf))) {
 		return 1;
 	}
 
 	if (status_mode) {
 		return print_status(&opts);
+	}
+	if (list_systems_mode) {
+		return list_systems(&opts);
+	}
+	if (list_games_buf[0] != '\0') {
+		return list_games_json(&opts, list_games_buf);
 	}
 
 	RunStats stats;

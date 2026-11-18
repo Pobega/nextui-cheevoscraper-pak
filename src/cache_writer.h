@@ -52,6 +52,9 @@ bool cache_verify_file(const char* path);
 /** Check whether a non-empty file exists on disk (used for badges). */
 bool cache_file_exists_nonempty(const char* path);
 
+/** Check whether a valid achievementsets cache file exists for the given game hash. */
+bool cache_has_valid_game(const char* userdata_dir, const char* game_hash);
+
 void scraper_index_init(ScraperIndex* idx);
 void scraper_index_free(ScraperIndex* idx);
 bool scraper_index_load(ScraperIndex* idx, const char* path);

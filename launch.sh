@@ -21,6 +21,13 @@ chmod +x "$PAK_DIR/bin/$PLATFORM/"* 2>/dev/null || true
 MENU_FILE="/tmp/${PAK_NAME}-menu.txt"
 OUT_FILE="/tmp/${PAK_NAME}-choice.out"
 SYNC_LOG="/tmp/${PAK_NAME}-sync.log"
+SYS_LIST_TSV="/tmp/${PAK_NAME}-systems.tsv"
+SYS_MENU_FILE="/tmp/${PAK_NAME}-systems.txt"
+SYS_OUT_FILE="/tmp/${PAK_NAME}-system.out"
+ACT_MENU_FILE="/tmp/${PAK_NAME}-action.txt"
+ACT_OUT_FILE="/tmp/${PAK_NAME}-action.out"
+GAMES_JSON="/tmp/${PAK_NAME}-games.json"
+GAMES_OUT="/tmp/${PAK_NAME}-games.out"
 FIFO_PATH="/tmp/show2.fifo"
 SHOW2_PID=""
 PRESENTER_PID=""
@@ -48,7 +55,130 @@ stop_progress_ui() {
 
 cleanup() {
 	stop_progress_ui
-	rm -f "$MENU_FILE" "$OUT_FILE" "$SYNC_LOG" /tmp/stay_awake
+	rm -f "/tmp/${PAK_NAME}-"* /tmp/stay_awake
+}
+
+run_sync_with_ui() {
+	if command -v show2.elf >/dev/null 2>&1; then
+		LOGO_PATH=""
+		if [ -n "$SDCARD_PATH" ] && [ -f "$SDCARD_PATH/.system/res/logo.png" ]; then
+			LOGO_PATH="$SDCARD_PATH/.system/res/logo.png"
+		fi
+		rm -f "$FIFO_PATH"
+		show2.elf --mode=daemon --image="$LOGO_PATH" --text="Starting RA Cache..." --progress=0 >/dev/null 2>&1 &
+		SHOW2_PID=$!
+		wait_i=0
+		while [ ! -p "$FIFO_PATH" ] && [ "$wait_i" -lt 20 ]; do
+			usleep 100000 2>/dev/null || sleep 1
+			wait_i=$((wait_i + 1))
+		done
+	else
+		minui-presenter --message "Running..." --timeout -1 >/dev/null 2>&1 &
+		PRESENTER_PID=$!
+	fi
+
+	: > "$SYNC_LOG"
+	"$BIN" "$@" --fifo "$FIFO_PATH" > "$SYNC_LOG" 2>&1
+	SYNC_RC=$?
+	cat "$SYNC_LOG"
+
+	stop_progress_ui
+
+	SUMMARY="$(grep '^SUMMARY:' "$SYNC_LOG" | tail -n 1 | sed 's/^SUMMARY: //')"
+	if [ -z "$SUMMARY" ]; then
+		SUMMARY="$(tail -n 1 "$SYNC_LOG")"
+		if [ -z "$SUMMARY" ]; then
+			SUMMARY="Sync failed (exit $SYNC_RC)"
+		fi
+	fi
+
+	minui-presenter --message "$SUMMARY" --timeout 0 --confirm-show --confirm-text "OK"
+}
+
+system_menu() {
+	TAB="$(printf '\t')"
+	while true; do
+		if ! "$BIN" --list-systems > "$SYS_LIST_TSV" 2>/dev/null; then
+			minui-presenter --message "Failed to scan ROM systems" --timeout 0 --confirm-show --confirm-text "OK"
+			return
+		fi
+
+		if [ ! -s "$SYS_LIST_TSV" ]; then
+			minui-presenter --message "No supported ROM systems found" --timeout 0 --confirm-show --confirm-text "OK"
+			return
+		fi
+
+		: > "$SYS_MENU_FILE"
+		while IFS="$TAB" read -r s_folder s_tag s_count; do
+			[ -n "$s_folder" ] || continue
+			printf '%s (%s ROMs)\n' "$s_folder" "$s_count" >> "$SYS_MENU_FILE"
+		done < "$SYS_LIST_TSV"
+
+		rm -f "$SYS_OUT_FILE"
+		minui-list --disable-auto-sleep --file "$SYS_MENU_FILE" --format text --title "Sync by System" --confirm-text "SELECT" --write-location "$SYS_OUT_FILE" >/dev/null
+		RC=$?
+		if [ "$RC" -ne 0 ] || [ ! -f "$SYS_OUT_FILE" ]; then
+			return
+		fi
+
+		SYS_CHOICE="$(cat "$SYS_OUT_FILE")"
+		SYS_FOLDER=""
+		SYS_TAG=""
+		while IFS="$TAB" read -r s_folder s_tag s_count; do
+			if [ "${s_folder} (${s_count} ROMs)" = "$SYS_CHOICE" ]; then
+				SYS_FOLDER="$s_folder"
+				SYS_TAG="$s_tag"
+				break
+			fi
+		done < "$SYS_LIST_TSV"
+
+		if [ -z "$SYS_FOLDER" ]; then
+			continue
+		fi
+
+		while true; do
+			cat << EOF > "$ACT_MENU_FILE"
+Sync Uncached in $SYS_TAG
+Sync All in $SYS_TAG
+Select Games Manually...
+Back
+EOF
+			rm -f "$ACT_OUT_FILE"
+			minui-list --disable-auto-sleep --file "$ACT_MENU_FILE" --format text --title "$SYS_FOLDER" --confirm-text "SELECT" --write-location "$ACT_OUT_FILE" >/dev/null
+			RC=$?
+			if [ "$RC" -ne 0 ] || [ ! -f "$ACT_OUT_FILE" ]; then
+				break
+			fi
+
+			ACT_CHOICE="$(cat "$ACT_OUT_FILE")"
+			case "$ACT_CHOICE" in
+				"Sync Uncached in $SYS_TAG")
+					run_sync_with_ui --system "$SYS_FOLDER"
+					;;
+				"Sync All in $SYS_TAG")
+					run_sync_with_ui --system "$SYS_FOLDER" --force
+					;;
+				"Select Games Manually...")
+					if ! "$BIN" --list-games-json "$SYS_FOLDER" > "$GAMES_JSON" 2>/dev/null || [ ! -s "$GAMES_JSON" ]; then
+						minui-presenter --message "Failed to list games for $SYS_FOLDER" --timeout 0 --confirm-show --confirm-text "OK"
+						continue
+					fi
+					rm -f "$GAMES_OUT"
+					minui-list --disable-auto-sleep --file "$GAMES_JSON" --format json --item-key games --title "$SYS_FOLDER" --confirm-text "SYNC" --write-value state --write-location "$GAMES_OUT" >/dev/null
+					RC=$?
+					if [ "$RC" -eq 0 ] && [ -f "$GAMES_OUT" ]; then
+						run_sync_with_ui --system "$SYS_FOLDER" --sync-json "$GAMES_OUT" --force
+					fi
+					;;
+				"Back"|"")
+					break
+					;;
+				*)
+					break
+					;;
+			esac
+		done
+	done
 }
 
 echo "1" > /tmp/stay_awake
@@ -75,6 +205,7 @@ fi
 
 cat << 'EOF' > "$MENU_FILE"
 Sync New Games
+Sync by System...
 Refresh Sessions
 Force Rebuild Cache
 Exit
@@ -92,13 +223,16 @@ while true; do
 	CHOICE="$(cat "$OUT_FILE")"
 	case "$CHOICE" in
 		"Sync New Games")
-			FLAG=""
+			run_sync_with_ui
+			;;
+		"Sync by System...")
+			system_menu
 			;;
 		"Refresh Sessions")
-			FLAG="--refresh-sessions"
+			run_sync_with_ui --refresh-sessions
 			;;
 		"Force Rebuild Cache")
-			FLAG="--force"
+			run_sync_with_ui --force
 			;;
 		"Exit"|"")
 			break
@@ -107,45 +241,6 @@ while true; do
 			break
 			;;
 	esac
-
-	if command -v show2.elf >/dev/null 2>&1; then
-		LOGO_PATH=""
-		if [ -n "$SDCARD_PATH" ] && [ -f "$SDCARD_PATH/.system/res/logo.png" ]; then
-			LOGO_PATH="$SDCARD_PATH/.system/res/logo.png"
-		fi
-		rm -f "$FIFO_PATH"
-		show2.elf --mode=daemon --image="$LOGO_PATH" --text="Starting RA Cache..." --progress=0 >/dev/null 2>&1 &
-		SHOW2_PID=$!
-		wait_i=0
-		while [ ! -p "$FIFO_PATH" ] && [ "$wait_i" -lt 20 ]; do
-			usleep 100000 2>/dev/null || sleep 1
-			wait_i=$((wait_i + 1))
-		done
-	else
-		minui-presenter --message "Running..." --timeout -1 >/dev/null 2>&1 &
-		PRESENTER_PID=$!
-	fi
-
-	: > "$SYNC_LOG"
-	if [ -n "$FLAG" ]; then
-		"$BIN" --fifo "$FIFO_PATH" "$FLAG" > "$SYNC_LOG" 2>&1
-	else
-		"$BIN" --fifo "$FIFO_PATH" > "$SYNC_LOG" 2>&1
-	fi
-	SYNC_RC=$?
-	cat "$SYNC_LOG"
-
-	stop_progress_ui
-
-	SUMMARY="$(grep '^SUMMARY:' "$SYNC_LOG" | tail -n 1 | sed 's/^SUMMARY: //')"
-	if [ -z "$SUMMARY" ]; then
-		SUMMARY="$(tail -n 1 "$SYNC_LOG")"
-		if [ -z "$SUMMARY" ]; then
-			SUMMARY="Sync failed (exit $SYNC_RC)"
-		fi
-	fi
-
-	minui-presenter --message "$SUMMARY" --timeout 0 --confirm-show --confirm-text "OK"
 done
 
 exit 0
