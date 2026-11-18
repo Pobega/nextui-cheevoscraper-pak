@@ -53,7 +53,8 @@ APP_SOURCES := \
 	$(CURDIR)/src/main.c \
 	$(CURDIR)/src/cache_writer.c \
 	$(CURDIR)/src/http_client.c \
-	$(CURDIR)/src/rom_hasher.c
+	$(CURDIR)/src/rom_hasher.c \
+	$(CURDIR)/src/ui.c
 
 TARGET_PLATFORM ?= host
 TARGET_CC ?= gcc
@@ -69,7 +70,7 @@ APP_BIN := $(BUILD_DIR)/bin/$(TARGET_PLATFORM)/ra-cache
 
 RCHEEVOS_CFLAGS := $(TARGET_OPT) -std=gnu99 -I$(RCHEEVOS_INCDIR) -I$(RCHEEVOS_SRCDIR) -DRC_DISABLE_LUA
 APP_CFLAGS := $(TARGET_OPT) -std=gnu99 -Wall -Wextra -Werror -I$(RCHEEVOS_INCDIR) -I$(CURDIR)/src
-APP_LDFLAGS := -lcrypto -lzip -lpthread -lm
+APP_LDFLAGS := -lcrypto -lzip -lSDL2 -lSDL2_ttf -lpthread -lm
 
 .PHONY: all rcheevos host internal-build build package clean distclean $(foreach p,$(PLATFORMS),build-$(p))
 
