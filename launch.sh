@@ -301,6 +301,7 @@ while true; do
 	minui-list --disable-auto-sleep --file "$MENU_FILE" --format text --title "$STATUS_LINE" --confirm-text "SELECT" --write-location "$OUT_FILE" >/dev/null
 	RC=$?
 	if [ "$RC" -ne 0 ] || [ ! -f "$OUT_FILE" ]; then
+		echo "minui-list main menu exited with code $RC" >&2
 		break
 	fi
 

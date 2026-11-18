@@ -91,4 +91,10 @@ void cache_format_size(uint64_t bytes, char* out, size_t out_size);
 /** Collect cache counts and total size under <userdata_dir>/.ra. */
 void cache_collect_stats(const char* userdata_dir, CacheClassifyGameFn classify_game, CacheStats* out);
 
+/**
+ * Format a relative ROM path for checklist display: strips trailing file
+ * extension and truncates with "..." to at most max_chars bytes.
+ */
+void format_game_display_name(const char* rel_path, char* out, size_t out_size, size_t max_chars);
+
 #endif

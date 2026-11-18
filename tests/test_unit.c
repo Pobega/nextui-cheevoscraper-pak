@@ -396,6 +396,22 @@ static void test_parse_badge_mode(void) {
 	ASSERT_TRUE(!parse_badge_mode("all", NULL));
 }
 
+static void test_ra_format_display_name(void) {
+	char buf[64];
+
+	ra_format_display_name("Super Mario World (USA).sfc", buf, sizeof(buf), 24);
+	ASSERT_EQ_STR("Super Mario World (USA)", buf);
+
+	ra_format_display_name("Mario/Super Mario World (USA) (Rev 1).zip", buf, sizeof(buf), 24);
+	ASSERT_EQ_STR("Mario/Super Mario Wor...", buf);
+
+	ra_format_display_name("Short.gb", buf, sizeof(buf), 24);
+	ASSERT_EQ_STR("Short", buf);
+
+	ra_format_display_name("", buf, sizeof(buf), 24);
+	ASSERT_EQ_STR("", buf);
+}
+
 int main(void) {
 	test_ra_extract_emu_tag();
 	test_ra_get_console_id();
@@ -406,6 +422,7 @@ int main(void) {
 	test_cache_collect_stats();
 	test_ra_is_disc_console();
 	test_parse_badge_mode();
+	test_ra_format_display_name();
 
 	if (g_tests_failed > 0) {
 		fprintf(stderr, "%d/%d assertions failed\n", g_tests_failed, g_tests_run);

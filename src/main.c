@@ -933,13 +933,16 @@ static int list_games_json(const SyncOptions* opts, const char* folder_name) {
 		const char* hash = scraper_index_lookup(&index, rom->rel_path, rom->console_id, rom->mtime, rom->size);
 		bool cached = hash && cache_has_valid_game(opts->userdata_dir, hash);
 
+		char display_name[64];
+		ra_format_display_name(sub_rel, display_name, sizeof(display_name), 24);
+
 		if (i > 0) {
 			fputc(',', stdout);
 		}
 		fputs("{\"name\":\"", stdout);
-		print_json_escaped(stdout, sub_rel);
+		print_json_escaped(stdout, display_name);
 		if (cached) {
-			fputs("\",\"options\":[\"Skip (Cached)\",\"Sync\"],\"selected\":0}", stdout);
+			fputs("\",\"options\":[\"Cached\",\"Sync\"],\"selected\":0}", stdout);
 		} else {
 			fputs("\",\"options\":[\"Skip\",\"Sync\"],\"selected\":0}", stdout);
 		}
@@ -1378,14 +1381,42 @@ static bool parse_minui_list_json(const char* json_path, const char* item_key,
 	return ok;
 }
 
-static void on_game_json_item(const char* name, long selected, void* ctx) {
-	if (selected == 1) {
-		string_set_insert((StringSet*)ctx, name);
-	}
+typedef struct {
+	size_t* indices;
+	size_t count;
+	size_t capacity;
+	size_t current;
+} SelectedIndices;
+
+static void selected_indices_free(SelectedIndices* sel) {
+	free(sel->indices);
+	sel->indices = NULL;
+	sel->count = 0;
+	sel->capacity = 0;
+	sel->current = 0;
 }
 
-static bool parse_selected_games_json(const char* json_path, StringSet* out_names) {
-	return parse_minui_list_json(json_path, "games", on_game_json_item, out_names);
+static void on_game_json_item(const char* name, long selected, void* ctx) {
+	(void)name;
+	SelectedIndices* sel = (SelectedIndices*)ctx;
+	size_t idx = sel->current++;
+	if (selected != 1) {
+		return;
+	}
+	if (sel->count == sel->capacity) {
+		size_t next_cap = sel->capacity ? sel->capacity * 2 : 16;
+		size_t* next = (size_t*)realloc(sel->indices, next_cap * sizeof(size_t));
+		if (!next) {
+			return;
+		}
+		sel->indices = next;
+		sel->capacity = next_cap;
+	}
+	sel->indices[sel->count++] = idx;
+}
+
+static bool parse_selected_games_json(const char* json_path, SelectedIndices* out_sel) {
+	return parse_minui_list_json(json_path, "games", on_game_json_item, out_sel);
 }
 
 typedef struct {
@@ -1430,42 +1461,41 @@ static bool collect_roms_from_json(const SyncOptions* opts, RomList* list, bool*
 		return false;
 	}
 
-	StringSet selected = {0};
+	SelectedIndices selected = {0};
 	if (!parse_selected_games_json(opts->sync_json_path, &selected)) {
 		fprintf(stderr, "Error: failed to parse selected games from %s\n", opts->sync_json_path);
-		string_set_free(&selected);
+		selected_indices_free(&selected);
 		return false;
 	}
 
 	if (selected.count == 0) {
 		*out_empty = true;
-		string_set_free(&selected);
+		selected_indices_free(&selected);
 		return true;
+	}
+
+	RomList all_roms = {0};
+	walk_console_dir(folder_path, opts->system_folder, console_id, 0, &all_roms, NULL);
+	if (all_roms.count > 1) {
+		qsort(all_roms.items, all_roms.count, sizeof(*all_roms.items), rom_entry_cmp);
 	}
 
 	for (size_t i = 0; i < selected.count; i++) {
 		if (opts->limit > 0 && list->count >= (size_t)opts->limit) {
 			break;
 		}
-
-		const char* sub_rel = selected.names[i];
-		char abs_path[CACHE_MAX_PATH];
-		char rel_path[CACHE_MAX_PATH];
-		if (snprintf(abs_path, sizeof(abs_path), "%s/%s", folder_path, sub_rel) >= (int)sizeof(abs_path) ||
-		    snprintf(rel_path, sizeof(rel_path), "%s/%s", opts->system_folder, sub_rel) >= (int)sizeof(rel_path)) {
+		size_t idx = selected.indices[i];
+		if (idx >= all_roms.count) {
+			fprintf(stderr, "Warning: selected game index %zu out of range (total %zu)\n",
+			        idx, all_roms.count);
 			continue;
 		}
-
-		struct stat st;
-		if (stat(abs_path, &st) != 0 || !S_ISREG(st.st_mode)) {
-			fprintf(stderr, "Warning: selected ROM not found: %s\n", abs_path);
-			continue;
-		}
-
-		rom_list_push(list, abs_path, rel_path, console_id, st.st_mtime, (int64_t)st.st_size);
+		const RomEntry* rom = &all_roms.items[idx];
+		rom_list_push(list, rom->abs_path, rom->rel_path, rom->console_id, rom->mtime, rom->size);
 	}
 
-	string_set_free(&selected);
+	rom_list_free(&all_roms);
+	selected_indices_free(&selected);
 	return true;
 }
 

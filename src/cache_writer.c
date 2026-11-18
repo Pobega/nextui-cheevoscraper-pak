@@ -457,3 +457,43 @@ void cache_collect_stats(const char* userdata_dir, CacheClassifyGameFn classify_
 	}
 	scraper_index_free(&idx);
 }
+
+void format_game_display_name(const char* rel_path, char* out, size_t out_size, size_t max_chars) {
+	if (!out || out_size == 0) {
+		return;
+	}
+	out[0] = '\0';
+	if (!rel_path || !*rel_path || max_chars == 0 || out_size == 1) {
+		return;
+	}
+
+	const char* slash = strrchr(rel_path, '/');
+	const char* base = slash ? slash + 1 : rel_path;
+	const char* dot = strrchr(base, '.');
+	size_t stem_len = (dot && dot > base) ? (size_t)(dot - rel_path) : strlen(rel_path);
+
+	size_t eff_max = max_chars;
+	if (eff_max > out_size - 1) {
+		eff_max = out_size - 1;
+	}
+
+	if (stem_len <= eff_max) {
+		memcpy(out, rel_path, stem_len);
+		out[stem_len] = '\0';
+		return;
+	}
+
+	if (eff_max <= 3) {
+		memcpy(out, rel_path, eff_max);
+		out[eff_max] = '\0';
+		return;
+	}
+
+	size_t cut = eff_max - 3;
+	while (cut > 0 && ((unsigned char)rel_path[cut] & 0xC0) == 0x80) {
+		cut--;
+	}
+	memcpy(out, rel_path, cut);
+	memcpy(out + cut, "...", 3);
+	out[cut + 3] = '\0';
+}
