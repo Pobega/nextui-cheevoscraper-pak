@@ -296,6 +296,44 @@ EOF
 	fi
 }
 
+cache_tools_menu() {
+	TOOLS_MENU_FILE="/tmp/${PAK_NAME}-tools-menu.json"
+	TOOLS_OUT_FILE="/tmp/${PAK_NAME}-tools-out.txt"
+	cat << 'EOF' > "$TOOLS_MENU_FILE"
+["Force Rebuild Cache","Re-check Unrecognized","Cache Info","Back"]
+EOF
+	while true; do
+		rm -f "$TOOLS_OUT_FILE"
+		minui-list --disable-auto-sleep --file "$TOOLS_MENU_FILE" --format json --title "Cache Tools" --confirm-text "SELECT" --write-location "$TOOLS_OUT_FILE" >/dev/null
+		RC=$?
+		if [ "$RC" -ne 0 ] || [ ! -f "$TOOLS_OUT_FILE" ]; then
+			break
+		fi
+		T_CHOICE="$(cat "$TOOLS_OUT_FILE")"
+		case "$T_CHOICE" in
+			"Force Rebuild Cache")
+				run_sync_with_ui --force
+				STATUS_DIRTY=1
+				;;
+			"Re-check Unrecognized")
+				OUT="$("$BIN" --clear-unrecognized 2>&1)"
+				STATUS_DIRTY=1
+				minui-presenter --message "$OUT" --timeout 0 --confirm-show --confirm-text "OK"
+				;;
+			"Cache Info")
+				start_busy "Calculating cache stats..."
+				INFO="$("$BIN" --cache-info)"
+				stop_busy
+				minui-presenter --message "$INFO" --timeout 0 --confirm-show --confirm-text "OK"
+				;;
+			*)
+				break
+				;;
+		esac
+	done
+	rm -f "$TOOLS_MENU_FILE" "$TOOLS_OUT_FILE"
+}
+
 echo "1" > /tmp/stay_awake
 trap cleanup EXIT INT TERM HUP QUIT
 
@@ -321,7 +359,7 @@ fi
 load_settings
 
 cat << 'EOF' > "$MENU_FILE"
-["Sync New Games","Sync by System...","Refresh Sessions","Force Rebuild Cache","Re-check Unrecognized","Cache Info","Settings","Exit"]
+["Sync New Games","Sync by System...","Refresh Sessions","Cache Tools...","Settings","Exit"]
 EOF
 
 while true; do
@@ -350,20 +388,8 @@ while true; do
 			run_sync_with_ui --refresh-sessions
 			STATUS_DIRTY=1
 			;;
-		"Force Rebuild Cache")
-			run_sync_with_ui --force
-			STATUS_DIRTY=1
-			;;
-		"Re-check Unrecognized")
-			OUT="$("$BIN" --clear-unrecognized 2>&1)"
-			STATUS_DIRTY=1
-			minui-presenter --message "$OUT" --timeout 0 --confirm-show --confirm-text "OK"
-			;;
-		"Cache Info")
-			start_busy "Calculating cache stats..."
-			INFO="$("$BIN" --cache-info)"
-			stop_busy
-			minui-presenter --message "$INFO" --timeout 0 --confirm-show --confirm-text "OK"
+		"Cache Tools...")
+			cache_tools_menu
 			;;
 		"Settings")
 			settings_menu
