@@ -209,12 +209,163 @@ static void test_game_sets_unrecognized_detection(void) {
 	rc_api_destroy_fetch_game_sets_response(&sets_rec);
 }
 
+static void test_cache_format_size(void) {
+	char buf[32];
+
+	cache_format_size(0, buf, sizeof(buf));
+	ASSERT_EQ_STR("0 KB", buf);
+
+	cache_format_size(1, buf, sizeof(buf));
+	ASSERT_EQ_STR("1 KB", buf);
+
+	cache_format_size(102400, buf, sizeof(buf));
+	ASSERT_EQ_STR("100 KB", buf);
+
+	cache_format_size((1024ULL * 1024ULL) - 1024ULL, buf, sizeof(buf));
+	ASSERT_EQ_STR("1023 KB", buf);
+
+	cache_format_size(1024ULL * 1024ULL, buf, sizeof(buf));
+	ASSERT_EQ_STR("1.0 MB", buf);
+
+	cache_format_size(1572864ULL, buf, sizeof(buf));
+	ASSERT_EQ_STR("1.5 MB", buf);
+
+	cache_format_size(12ULL * 1024ULL * 1024ULL, buf, sizeof(buf));
+	ASSERT_EQ_STR("12.0 MB", buf);
+}
+
+static bool write_dummy_file(const char* path, size_t size, const char* content) {
+	FILE* f = fopen(path, "wb");
+	if (!f) {
+		return false;
+	}
+	if (content) {
+		fwrite(content, 1, strlen(content), f);
+	} else {
+		for (size_t i = 0; i < size; i++) {
+			fputc('x', f);
+		}
+	}
+	fclose(f);
+	return true;
+}
+
+static int test_classify_game(const char* path) {
+	FILE* f = fopen(path, "rb");
+	if (!f) {
+		return -1;
+	}
+	char buf[512];
+	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[n] = '\0';
+
+	rc_api_server_response_t srv = {
+		.body = buf,
+		.body_length = n,
+		.http_status_code = 200
+	};
+	rc_api_fetch_game_sets_response_t sets;
+	int rc = rc_api_process_fetch_game_sets_server_response(&sets, &srv);
+	int result = -1;
+	if (rc == RC_OK && sets.response.succeeded) {
+		result = (sets.id != 0) ? 1 : 0;
+	}
+	rc_api_destroy_fetch_game_sets_response(&sets);
+	return result;
+}
+
+static void test_cache_collect_stats(void) {
+	char tmp_dir[] = "/tmp/ra_stats_test_XXXXXX";
+	ASSERT_TRUE(mkdtemp(tmp_dir) != NULL);
+
+	CacheStats empty_stats;
+	cache_collect_stats(tmp_dir, test_classify_game, &empty_stats);
+	ASSERT_EQ_INT(0, empty_stats.recognized_games);
+	ASSERT_EQ_INT(0, empty_stats.unrecognized_games);
+	ASSERT_EQ_INT(0, empty_stats.indexed_roms);
+	ASSERT_EQ_INT(0, empty_stats.cached_badges);
+	ASSERT_EQ_INT(0, empty_stats.total_bytes);
+
+	char cache_dir[256];
+	char badges_dir[256];
+	snprintf(cache_dir, sizeof(cache_dir), "%s/.ra/offline/cache", tmp_dir);
+	snprintf(badges_dir, sizeof(badges_dir), "%s/.ra/badges", tmp_dir);
+	ASSERT_TRUE(cache_mkdirs(cache_dir));
+	ASSERT_TRUE(cache_mkdirs(badges_dir));
+
+	const char* rec_json =
+		"{\"Success\":true,\"GameId\":228,\"Title\":\"SMW\","
+		"\"ConsoleId\":3,\"ImageIconUrl\":\"/Images/1.png\",\"Sets\":[]}";
+	const char* unrec_json =
+		"{\"Success\":true,\"GameId\":0,\"Title\":\"\","
+		"\"ConsoleId\":0,\"ImageIconUrl\":\"/Images/0.png\",\"Sets\":[]}";
+
+	char f_rec1[512], f_rec2[512], f_unrec[512];
+	char f_login[512], f_badge1[512], f_badge2[512];
+	char f_ignored[512];
+	snprintf(f_rec1, sizeof(f_rec1), "%s/achievementsets_aaa.bin", cache_dir);
+	snprintf(f_rec2, sizeof(f_rec2), "%s/achievementsets_bbb.bin", cache_dir);
+	snprintf(f_unrec, sizeof(f_unrec), "%s/achievementsets_ccc.bin", cache_dir);
+	snprintf(f_login, sizeof(f_login), "%s/login.bin", cache_dir);
+	snprintf(f_badge1, sizeof(f_badge1), "%s/100.png", badges_dir);
+	snprintf(f_badge2, sizeof(f_badge2), "%s/100_lock.png", badges_dir);
+	snprintf(f_ignored, sizeof(f_ignored), "%s/notes.txt", badges_dir);
+
+	ASSERT_TRUE(write_dummy_file(f_rec1, 0, rec_json));
+	ASSERT_TRUE(write_dummy_file(f_rec2, 0, rec_json));
+	ASSERT_TRUE(write_dummy_file(f_unrec, 0, unrec_json));
+	ASSERT_TRUE(write_dummy_file(f_login, 200, NULL));
+	ASSERT_TRUE(write_dummy_file(f_badge1, 500, NULL));
+	ASSERT_TRUE(write_dummy_file(f_badge2, 600, NULL));
+	ASSERT_TRUE(write_dummy_file(f_ignored, 999, NULL));
+
+	char index_path[CACHE_MAX_PATH];
+	cache_index_path(tmp_dir, index_path, sizeof(index_path));
+	ScraperIndex idx;
+	scraper_index_init(&idx);
+	ASSERT_TRUE(scraper_index_upsert(&idx, "SFC/a.sfc", RC_CONSOLE_SUPER_NINTENDO, 10, 100, "0123456789abcdef0123456789abcdef"));
+	ASSERT_TRUE(scraper_index_upsert(&idx, "SFC/b.sfc", RC_CONSOLE_SUPER_NINTENDO, 20, 200, "fedcba9876543210fedcba9876543210"));
+	ASSERT_TRUE(scraper_index_upsert(&idx, "SFC/c.sfc", RC_CONSOLE_SUPER_NINTENDO, 30, 300, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+	ASSERT_TRUE(scraper_index_save(&idx, index_path));
+	scraper_index_free(&idx);
+
+	CacheStats stats;
+	cache_collect_stats(tmp_dir, test_classify_game, &stats);
+	ASSERT_EQ_INT(2, stats.recognized_games);
+	ASSERT_EQ_INT(1, stats.unrecognized_games);
+	ASSERT_EQ_INT(3, stats.indexed_roms);
+	ASSERT_EQ_INT(2, stats.cached_badges);
+
+	uint64_t expected_bytes = strlen(rec_json) * 2 + strlen(unrec_json) + 200 + 500 + 600;
+	ASSERT_EQ_INT(expected_bytes, stats.total_bytes);
+
+	unlink(f_rec1);
+	unlink(f_rec2);
+	unlink(f_unrec);
+	unlink(f_login);
+	unlink(f_badge1);
+	unlink(f_badge2);
+	unlink(f_ignored);
+	unlink(index_path);
+	rmdir(cache_dir);
+	rmdir(badges_dir);
+	char offline_dir[CACHE_MAX_PATH], ra_dir[CACHE_MAX_PATH];
+	snprintf(offline_dir, sizeof(offline_dir), "%s/.ra/offline", tmp_dir);
+	snprintf(ra_dir, sizeof(ra_dir), "%s/.ra", tmp_dir);
+	rmdir(offline_dir);
+	rmdir(ra_dir);
+	rmdir(tmp_dir);
+}
+
 int main(void) {
 	test_ra_extract_emu_tag();
 	test_ra_get_console_id();
 	test_cache_paths();
 	test_scraper_index_lifecycle();
 	test_game_sets_unrecognized_detection();
+	test_cache_format_size();
+	test_cache_collect_stats();
 
 	if (g_tests_failed > 0) {
 		fprintf(stderr, "%d/%d assertions failed\n", g_tests_failed, g_tests_run);

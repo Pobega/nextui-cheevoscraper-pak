@@ -209,6 +209,7 @@ Sync by System...
 Refresh Sessions
 Force Rebuild Cache
 Re-check Unrecognized
+Cache Info
 Exit
 EOF
 
@@ -238,6 +239,10 @@ while true; do
 		"Re-check Unrecognized")
 			OUT="$("$BIN" --clear-unrecognized 2>&1)"
 			minui-presenter --message "$OUT" --timeout 0 --confirm-show --confirm-text "OK"
+			;;
+		"Cache Info")
+			INFO="$("$BIN" --cache-info)"
+			minui-presenter --message "$INFO" --timeout 0 --confirm-show --confirm-text "OK"
 			;;
 		"Exit"|"")
 			break

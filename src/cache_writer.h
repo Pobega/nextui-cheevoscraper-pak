@@ -71,4 +71,24 @@ const char* scraper_index_lookup(const ScraperIndex* idx, const char* rel_path,
 bool scraper_index_upsert(ScraperIndex* idx, const char* rel_path,
                           int console_id, time_t mtime, int64_t size, const char* hash);
 
+typedef struct {
+	size_t recognized_games;
+	size_t unrecognized_games;
+	size_t indexed_roms;
+	size_t cached_badges;
+	uint64_t total_bytes;
+} CacheStats;
+
+/**
+ * Callback returning >0 for recognized game cache files, 0 for unrecognized
+ * (id == 0), and <0 for invalid/unreadable files.
+ */
+typedef int (*CacheClassifyGameFn)(const char* path);
+
+/** Format a byte count as "<N> KB" (< 1 MiB) or "<X.X> MB" (>= 1 MiB). */
+void cache_format_size(uint64_t bytes, char* out, size_t out_size);
+
+/** Collect cache counts and total size under <userdata_dir>/.ra. */
+void cache_collect_stats(const char* userdata_dir, CacheClassifyGameFn classify_game, CacheStats* out);
+
 #endif

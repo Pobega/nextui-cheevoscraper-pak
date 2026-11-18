@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cache_writer.h"
 
+#include <dirent.h>
 #include <errno.h>
 #ifndef CACHE_WRITER_NO_CRYPTO
 #include <openssl/evp.h>
@@ -337,4 +338,122 @@ bool scraper_index_upsert(ScraperIndex* idx, const char* rel_path,
 	}
 	idx->dirty = true;
 	return true;
+}
+
+static bool str_ends_with(const char* name, const char* suffix) {
+	size_t nlen = strlen(name);
+	size_t slen = strlen(suffix);
+	return nlen > slen && strcmp(name + nlen - slen, suffix) == 0;
+}
+
+void cache_format_size(uint64_t bytes, char* out, size_t out_size) {
+	if (!out || out_size == 0) {
+		return;
+	}
+	const uint64_t one_mib = 1024ULL * 1024ULL;
+	if (bytes < one_mib) {
+		uint64_t kb = (bytes + 512ULL) / 1024ULL;
+		if (bytes > 0 && kb == 0) {
+			kb = 1;
+		}
+		snprintf(out, out_size, "%llu KB", (unsigned long long)kb);
+	} else {
+		double mb = (double)bytes / (double)one_mib;
+		snprintf(out, out_size, "%.1f MB", mb);
+	}
+}
+
+static void scan_cache_bin_dir(const char* cache_dir, CacheClassifyGameFn classify_game, CacheStats* out) {
+	DIR* dir = opendir(cache_dir);
+	if (!dir) {
+		return;
+	}
+
+	struct dirent* ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.' || !str_ends_with(ent->d_name, ".bin")) {
+			continue;
+		}
+
+		char full_path[CACHE_MAX_PATH];
+		if (snprintf(full_path, sizeof(full_path), "%s/%s", cache_dir, ent->d_name) >= (int)sizeof(full_path)) {
+			continue;
+		}
+
+		struct stat st;
+		if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+			continue;
+		}
+
+		out->total_bytes += (uint64_t)st.st_size;
+
+		if (strncmp(ent->d_name, "achievementsets_", 16) == 0) {
+			int cls = classify_game ? classify_game(full_path) : 1;
+			if (cls > 0) {
+				out->recognized_games++;
+			} else if (cls == 0) {
+				out->unrecognized_games++;
+			}
+		}
+	}
+
+	closedir(dir);
+}
+
+static void scan_badges_dir(const char* badges_dir, CacheStats* out) {
+	DIR* dir = opendir(badges_dir);
+	if (!dir) {
+		return;
+	}
+
+	struct dirent* ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.' || !str_ends_with(ent->d_name, ".png")) {
+			continue;
+		}
+
+		char full_path[CACHE_MAX_PATH];
+		if (snprintf(full_path, sizeof(full_path), "%s/%s", badges_dir, ent->d_name) >= (int)sizeof(full_path)) {
+			continue;
+		}
+
+		struct stat st;
+		if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+			continue;
+		}
+
+		out->cached_badges++;
+		out->total_bytes += (uint64_t)st.st_size;
+	}
+
+	closedir(dir);
+}
+
+void cache_collect_stats(const char* userdata_dir, CacheClassifyGameFn classify_game, CacheStats* out) {
+	if (!out) {
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+	if (!userdata_dir || !*userdata_dir) {
+		return;
+	}
+
+	char cache_dir[CACHE_MAX_PATH];
+	if (snprintf(cache_dir, sizeof(cache_dir), "%s/.ra/offline/cache", userdata_dir) < (int)sizeof(cache_dir)) {
+		scan_cache_bin_dir(cache_dir, classify_game, out);
+	}
+
+	char badges_dir[CACHE_MAX_PATH];
+	if (snprintf(badges_dir, sizeof(badges_dir), "%s/.ra/badges", userdata_dir) < (int)sizeof(badges_dir)) {
+		scan_badges_dir(badges_dir, out);
+	}
+
+	char index_path[CACHE_MAX_PATH];
+	cache_index_path(userdata_dir, index_path, sizeof(index_path));
+	ScraperIndex idx;
+	scraper_index_init(&idx);
+	if (scraper_index_load(&idx, index_path)) {
+		out->indexed_roms = idx.count;
+	}
+	scraper_index_free(&idx);
 }
