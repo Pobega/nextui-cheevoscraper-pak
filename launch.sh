@@ -73,7 +73,7 @@ start_busy() {
 
 stop_busy() {
 	if [ -n "$BUSY_PID" ] && kill -0 "$BUSY_PID" 2>/dev/null; then
-		kill "$BUSY_PID" 2>/dev/null || true
+		kill -9 "$BUSY_PID" 2>/dev/null || true
 		wait "$BUSY_PID" 2>/dev/null || true
 	fi
 	BUSY_PID=""
@@ -94,11 +94,11 @@ stop_progress_ui() {
 		rm -f "$FIFO_PATH"
 	fi
 	if [ -n "$PRESENTER_PID" ]; then
-		kill "$PRESENTER_PID" 2>/dev/null || true
+		kill -9 "$PRESENTER_PID" 2>/dev/null || true
 		wait "$PRESENTER_PID" 2>/dev/null || true
 		PRESENTER_PID=""
 	fi
-	killall minui-presenter >/dev/null 2>&1 || true
+	killall -9 minui-presenter >/dev/null 2>&1 || true
 }
 
 cleanup() {
