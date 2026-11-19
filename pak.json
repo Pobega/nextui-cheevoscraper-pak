@@ -1,9 +1,10 @@
 {
-  "name": "RA Cache",
+  "name": "CheevoScraper",
   "type": "TOOL",
   "description": "Pre-downloads RetroAchievements cache and badges for offline play on NextUI",
   "author": "Pobega",
-  "release_filename": "RA Cache.pak.zip",
+  "repo_url": "https://github.com/Pobega/nextui-cheevoscraper-pak",
+  "release_filename": "CheevoScraper.pak.zip",
   "platforms": [
     "tg5040",
     "h700"

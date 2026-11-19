@@ -1,4 +1,4 @@
-PAK_NAME ?= RA Cache
+PAK_NAME ?= CheevoScraper
 PLATFORMS ?= tg5040 h700
 
 PUSH_PLATFORM ?= tg5040

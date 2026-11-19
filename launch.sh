@@ -282,7 +282,7 @@ settings_menu() {
 EOF
 
 	rm -f "$SETTINGS_OUT"
-	minui-list --disable-auto-sleep --file "$SETTINGS_JSON" --format json --item-key settings --title "RA Cache Settings" --confirm-text "SAVE" --write-value state --write-location "$SETTINGS_OUT" >/dev/null
+	minui-list --disable-auto-sleep --file "$SETTINGS_JSON" --format json --item-key settings --title "CheevoScraper Settings" --confirm-text "SAVE" --write-value state --write-location "$SETTINGS_OUT" >/dev/null
 	RC=$?
 	if [ "$RC" -eq 0 ] && [ -f "$SETTINGS_OUT" ]; then
 		PARSED="$("$BIN" --parse-settings-json "$SETTINGS_OUT" 2>/dev/null)"
