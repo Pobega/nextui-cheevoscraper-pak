@@ -192,6 +192,14 @@ void http_response_free(HttpResponse* resp) {
 	resp->status_code = 0;
 }
 
+static const char* curl_tls_flag(void) {
+	if (access("/etc/ssl/certs/ca-certificates.crt", R_OK) == 0 ||
+	    access("/etc/ssl/cert.pem", R_OK) == 0) {
+		return "--location";
+	}
+	return "--insecure";
+}
+
 static bool post_once(HttpClient* client, const char* url, const char* post_data, HttpResponse* out_resp) {
 	enforce_rate_limit(client);
 
@@ -199,6 +207,7 @@ static bool post_once(HttpClient* client, const char* url, const char* post_data
 		"curl",
 		"--silent",
 		"--show-error",
+		(char*)curl_tls_flag(),
 		"--connect-timeout", HTTP_CONNECT_TIMEOUT_ARG,
 		"--max-time", HTTP_MAX_TIME_ARG,
 		"-A", HTTP_USER_AGENT,
@@ -260,6 +269,7 @@ static int download_once(HttpClient* client, const char* url, const char* tmp_pa
 		"--silent",
 		"--show-error",
 		"--location",
+		(char*)curl_tls_flag(),
 		"--connect-timeout", HTTP_CONNECT_TIMEOUT_ARG,
 		"--max-time", HTTP_MAX_TIME_ARG,
 		"-A", HTTP_USER_AGENT,
