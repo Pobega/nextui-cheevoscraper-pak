@@ -292,6 +292,7 @@ func selectGamesChecklist(bin string, cfg AppConfig, sys SystemEntry) bool {
 	}
 
 	opts := gaba.DefaultListOptions(sys.Folder, items)
+	opts.UseSmallTitle = true
 	opts.InitialMultiSelectMode = true
 	opts.SelectAllButton = constants.VirtualButtonX
 	opts.DeselectAllButton = constants.VirtualButtonY
@@ -358,6 +359,7 @@ func systemMenu(bin string, cfg AppConfig) bool {
 	selIdx := 0
 	for {
 		opts := gaba.DefaultListOptions("Sync by System", sysItems)
+		opts.UseSmallTitle = true
 		opts.SelectedIndex = selIdx
 		opts.FooterHelpItems = []gaba.FooterHelpItem{
 			{ButtonName: "A", HelpText: "Select"},
@@ -378,6 +380,7 @@ func systemMenu(bin string, cfg AppConfig) bool {
 				{Text: "Back"},
 			}
 			actOpts := gaba.DefaultListOptions(sys.Folder, actItems)
+			actOpts.UseSmallTitle = true
 			actOpts.FooterHelpItems = []gaba.FooterHelpItem{
 				{ButtonName: "A", HelpText: "Select"},
 				{ButtonName: "B", HelpText: "Back"},
@@ -547,6 +550,7 @@ func main() {
 			{Text: "Settings"},
 			{Text: "Exit"},
 		})
+		opts.UseSmallTitle = true
 		opts.SelectedIndex = selIdx
 		opts.FooterHelpItems = []gaba.FooterHelpItem{
 			{ButtonName: "A", HelpText: "Select"},
