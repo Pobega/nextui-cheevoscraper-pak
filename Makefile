@@ -56,8 +56,14 @@ RCHEEVOS_SOURCES := \
 	$(RCHEEVOS_SRCDIR)/rhash/hash_zip.c \
 	$(RCHEEVOS_SRCDIR)/rhash/md5.c
 
-MINUI_LIST_VERSION := 0.16.0
-MINUI_PRESENTER_VERSION := 0.13.4
+GO_VERSION ?= 1.24.3
+GO_DIR := $(BUILD_DIR)/go
+GO_BIN := $(GO_DIR)/bin/go
+GO_CACHE := $(BUILD_DIR)/gocache
+GO_MODCACHE := $(BUILD_DIR)/gomodcache
+
+SDL2_GFX_VERSION ?= 1.0.4
+SDL2_GFX_DIR := $(BUILD_DIR)/sdl2_gfx
 
 APP_SOURCES := \
 	$(CURDIR)/src/main.c \
@@ -164,34 +170,38 @@ test: rcheevos
 		$(BUILD_DIR)/host/librcheevos.a -lm -lpthread -o $(TEST_BIN)
 	$(TEST_BIN)
 
-$(BUILD_DIR)/bin/h700/minui-list:
-	@mkdir -p $(dir $@)
-	curl -f -sSL -o $@ https://github.com/josegonzalez/minui-list/releases/download/$(MINUI_LIST_VERSION)/minui-list-h700-nextui
-	chmod +x $@
+go-toolchain: $(GO_BIN)
 
-$(BUILD_DIR)/bin/h700/minui-presenter:
-	@mkdir -p $(dir $@)
-	curl -f -sSL -o $@ https://github.com/josegonzalez/minui-presenter/releases/download/$(MINUI_PRESENTER_VERSION)/minui-presenter-h700-nextui
-	chmod +x $@
+$(GO_BIN):
+	@mkdir -p $(BUILD_DIR)
+	@echo "Downloading Go $(GO_VERSION)..."
+	@curl -f -sSL -o $(BUILD_DIR)/go.tar.gz "https://go.dev/dl/go$(GO_VERSION).linux-amd64.tar.gz"
+	@rm -rf $(GO_DIR)
+	@tar -C $(BUILD_DIR) -xzf $(BUILD_DIR)/go.tar.gz
+	@rm -f $(BUILD_DIR)/go.tar.gz
 
-$(BUILD_DIR)/bin/%/minui-list:
-	@mkdir -p $(dir $@)
-	curl -f -sSL -o $@ https://github.com/josegonzalez/minui-list/releases/download/$(MINUI_LIST_VERSION)/minui-list-$*
-	chmod +x $@
+sdl2-gfx: $(SDL2_GFX_DIR)/.extracted
 
-$(BUILD_DIR)/bin/%/minui-presenter:
-	@mkdir -p $(dir $@)
-	curl -f -sSL -o $@ https://github.com/josegonzalez/minui-presenter/releases/download/$(MINUI_PRESENTER_VERSION)/minui-presenter-$*
-	chmod +x $@
+$(SDL2_GFX_DIR)/.extracted:
+	@mkdir -p $(SDL2_GFX_DIR)
+	@echo "Downloading SDL2_gfx $(SDL2_GFX_VERSION)..."
+	@curl -f -sSL -o $(BUILD_DIR)/sdl2_gfx.tar.gz "https://www.ferzkopp.net/Software/SDL2_gfx/SDL2_gfx-$(SDL2_GFX_VERSION).tar.gz"
+	@tar -C $(SDL2_GFX_DIR) --strip-components=1 -xzf $(BUILD_DIR)/sdl2_gfx.tar.gz
+	@rm -f $(BUILD_DIR)/sdl2_gfx.tar.gz
+	@touch $@
 
 build: $(foreach p,$(PLATFORMS),build-$(p))
 
 define BUILD_PLATFORM_RULE
-build-$(1): rcheevos libchdr $(BUILD_DIR)/bin/$(1)/minui-list $(BUILD_DIR)/bin/$(1)/minui-presenter
+build-$(1): rcheevos libchdr go-toolchain sdl2-gfx
 	@if [ -z "$$(CONTAINER_RUNTIME)" ]; then \
 		echo "Error: neither podman nor docker found in PATH"; exit 1; \
 	fi
-	@echo "Building ra-cache for $(1)..."
+	@echo "Building ra-cache and cheevoscraper-ui for $(1)..."
+	@mkdir -p $(GO_CACHE) $(GO_MODCACHE) $(BUILD_DIR)/bin/$(1) $(BUILD_DIR)/$(1)/sdl2_gfx $(BUILD_DIR)/$(1)/pkgconfig
+	@printf 'Name: SDL2_ttf\nDescription: SDL2_ttf\nVersion: 2.0.15\nLibs: -lSDL2_ttf\nCflags: -I/opt/aarch64-nextui-linux-gnu/aarch64-nextui-linux-gnu/libc/usr/include/SDL2\n' > $(BUILD_DIR)/$(1)/pkgconfig/SDL2_ttf.pc
+	@printf 'Name: SDL2_image\nDescription: SDL2_image\nVersion: 2.0.5\nLibs: -lSDL2_image\nCflags: -I/opt/aarch64-nextui-linux-gnu/aarch64-nextui-linux-gnu/libc/usr/include/SDL2\n' > $(BUILD_DIR)/$(1)/pkgconfig/SDL2_image.pc
+	@printf 'Name: SDL2_gfx\nDescription: SDL2_gfx\nVersion: $(SDL2_GFX_VERSION)\nLibs: -L/workspace/build/$(1)/sdl2_gfx -lSDL2_gfx\nCflags: -I/workspace/build/sdl2_gfx\n' > $(BUILD_DIR)/$(1)/pkgconfig/SDL2_gfx.pc
 	$$(CONTAINER_RUNTIME) run --rm $$(CONTAINER_MOUNT_OPTS) \
 		-v $$(CURDIR):/workspace:rw \
 		ghcr.io/loveretro/$(1)-toolchain:latest \
@@ -203,7 +213,26 @@ build-$(1): rcheevos libchdr $(BUILD_DIR)/bin/$(1)/minui-list $(BUILD_DIR)/bin/$
 				TARGET_AR=/opt/aarch64-nextui-linux-gnu/bin/aarch64-nextui-linux-gnu-ar \
 				TARGET_OPT="-O3 -mcpu=cortex-a53 -mtune=cortex-a53" && \
 			/opt/aarch64-nextui-linux-gnu/bin/aarch64-nextui-linux-gnu-strip --strip-unneeded /workspace/build/bin/$(1)/ra-cache && \
-			chmod 0755 /workspace/build/bin/$(1)/ra-cache \
+			chmod 0755 /workspace/build/bin/$(1)/ra-cache && \
+			if [ ! -f /workspace/build/$(1)/sdl2_gfx/libSDL2_gfx.a ]; then \
+				for src in SDL2_framerate.c SDL2_gfxPrimitives.c SDL2_imageFilter.c SDL2_rotozoom.c; do \
+					/opt/aarch64-nextui-linux-gnu/bin/aarch64-nextui-linux-gnu-gcc -O3 -mcpu=cortex-a53 -mtune=cortex-a53 -I/opt/aarch64-nextui-linux-gnu/aarch64-nextui-linux-gnu/libc/usr/include/SDL2 -I/workspace/build/sdl2_gfx -c -o /workspace/build/$(1)/sdl2_gfx/$$$$src.o /workspace/build/sdl2_gfx/$$$$src; \
+				done; \
+				/opt/aarch64-nextui-linux-gnu/bin/aarch64-nextui-linux-gnu-ar rcs /workspace/build/$(1)/sdl2_gfx/libSDL2_gfx.a /workspace/build/$(1)/sdl2_gfx/*.o; \
+			fi && \
+			cd /workspace/ui && \
+			export PATH="/workspace/build/go/bin:$$$$PATH" && \
+			export GOCACHE=/workspace/build/gocache && \
+			export GOMODCACHE=/workspace/build/gomodcache && \
+			export PKG_CONFIG_PATH="/workspace/build/$(1)/pkgconfig:/opt/aarch64-nextui-linux-gnu/aarch64-nextui-linux-gnu/libc/usr/lib/pkgconfig" && \
+			/workspace/build/go/bin/go get github.com/BrandonKowalski/gabagool/v2@main && \
+			/workspace/build/go/bin/go mod tidy && \
+			CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+			CC=/opt/aarch64-nextui-linux-gnu/bin/aarch64-nextui-linux-gnu-gcc \
+			CGO_CFLAGS="-I/opt/aarch64-nextui-linux-gnu/aarch64-nextui-linux-gnu/libc/usr/include/SDL2 -I/workspace/build/sdl2_gfx" \
+			CGO_LDFLAGS="-L/workspace/build/$(1)/sdl2_gfx -lSDL2_gfx" \
+			/workspace/build/go/bin/go build -trimpath -ldflags="-s -w" -o /workspace/build/bin/$(1)/cheevoscraper-ui . && \
+			chmod 0755 /workspace/build/bin/$(1)/cheevoscraper-ui \
 		'
 endef
 
@@ -212,23 +241,21 @@ $(foreach p,$(PLATFORMS),$(eval $(call BUILD_PLATFORM_RULE,$(p))))
 package:
 	@echo "Packaging $(PAK_NAME).pak..."
 	@rm -rf $(BUILD_DIR)/staging $(DIST_DIR)
-	@mkdir -p $(BUILD_DIR)/staging/bin $(BUILD_DIR)/staging/res $(DIST_DIR)
+	@mkdir -p $(BUILD_DIR)/staging/bin $(DIST_DIR)
 	@cp pak.json launch.sh README.md LICENSE $(BUILD_DIR)/staging/
-	@cp res/blank.png $(BUILD_DIR)/staging/res/
 	@chmod 0755 $(BUILD_DIR)/staging/launch.sh
 	@for p in $(PLATFORMS); do \
-		for b in ra-cache minui-list minui-presenter; do \
+		for b in ra-cache cheevoscraper-ui; do \
 			if [ ! -x "$(BUILD_DIR)/bin/$$p/$$b" ]; then \
 				echo "Error: missing binary $$b for $$p; run 'make build' first"; exit 1; \
 			fi; \
 		done; \
 		mkdir -p "$(BUILD_DIR)/staging/bin/$$p"; \
-		cp "$(BUILD_DIR)/bin/$$p/ra-cache" "$(BUILD_DIR)/bin/$$p/minui-list" "$(BUILD_DIR)/bin/$$p/minui-presenter" "$(BUILD_DIR)/staging/bin/$$p/"; \
-		mkdir -p "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/bin/$$p" "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/res"; \
+		cp "$(BUILD_DIR)/bin/$$p/ra-cache" "$(BUILD_DIR)/bin/$$p/cheevoscraper-ui" "$(BUILD_DIR)/staging/bin/$$p/"; \
+		mkdir -p "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/bin/$$p"; \
 		cp pak.json launch.sh README.md LICENSE "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/"; \
-		cp res/blank.png "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/res/"; \
 		chmod 0755 "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/launch.sh"; \
-		cp "$(BUILD_DIR)/bin/$$p/ra-cache" "$(BUILD_DIR)/bin/$$p/minui-list" "$(BUILD_DIR)/bin/$$p/minui-presenter" "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/bin/$$p/"; \
+		cp "$(BUILD_DIR)/bin/$$p/ra-cache" "$(BUILD_DIR)/bin/$$p/cheevoscraper-ui" "$(DIST_DIR)/Tools/$$p/$(PAK_NAME).pak/bin/$$p/"; \
 	done
 	@cd $(BUILD_DIR)/staging && zip -r "$(DIST_DIR)/$(PAK_NAME).pak.zip" .
 	@echo "Created $(DIST_DIR)/$(PAK_NAME).pak.zip"
