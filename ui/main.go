@@ -294,7 +294,7 @@ func selectGamesChecklist(bin string, cfg AppConfig, sys SystemEntry) bool {
 	opts := gaba.DefaultListOptions(sys.Folder, items)
 	opts.InitialMultiSelectMode = true
 	opts.SelectAllButton = constants.VirtualButtonX
-	opts.DestroyAllButton = constants.VirtualButtonY
+	opts.DeselectAllButton = constants.VirtualButtonY
 	opts.MultiSelectConfirmButton = constants.VirtualButtonStart
 	opts.FooterHelpItems = []gaba.FooterHelpItem{
 		{ButtonName: "A", HelpText: "Toggle"},

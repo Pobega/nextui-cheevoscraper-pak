@@ -230,7 +230,7 @@ build-$(1): rcheevos libchdr go-toolchain sdl2-gfx
 			CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
 			CC=/opt/aarch64-nextui-linux-gnu/bin/aarch64-nextui-linux-gnu-gcc \
 			CGO_CFLAGS="-I/opt/aarch64-nextui-linux-gnu/aarch64-nextui-linux-gnu/libc/usr/include/SDL2 -I/workspace/build/sdl2_gfx" \
-			CGO_LDFLAGS="-L/workspace/build/$(1)/sdl2_gfx -lSDL2_gfx" \
+			CGO_LDFLAGS="-L/workspace/build/$(1)/sdl2_gfx -lSDL2_gfx -lm" \
 			/workspace/build/go/bin/go build -trimpath -ldflags="-s -w" -o /workspace/build/bin/$(1)/cheevoscraper-ui . && \
 			chmod 0755 /workspace/build/bin/$(1)/cheevoscraper-ui \
 		'
