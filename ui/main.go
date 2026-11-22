@@ -191,16 +191,33 @@ func runSyncWithProgress(bin string, cfg AppConfig, title string, extraArgs ...s
 		}
 
 		waitErr := cmd.Wait()
+		if fifoPath != "" {
+			if wf, wErr := os.OpenFile(fifoPath, os.O_WRONLY|syscall.O_NONBLOCK, 0); wErr == nil {
+				_ = wf.Close()
+			}
+		}
 		<-doneReader
 		progress.Store(1.0)
 
 		output := outBuf.String()
+		if output != "" {
+			fmt.Fprintln(os.Stderr, output)
+		}
 		for _, line := range strings.Split(output, "\n") {
 			if strings.HasPrefix(line, "SUMMARY:") {
 				return strings.TrimSpace(strings.TrimPrefix(line, "SUMMARY:")), nil
 			}
 		}
 		if waitErr != nil {
+			lastLine := ""
+			for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+				if t := strings.TrimSpace(line); t != "" {
+					lastLine = t
+				}
+			}
+			if lastLine != "" {
+				return "", fmt.Errorf("%s", lastLine)
+			}
 			return "", fmt.Errorf("sync failed: %v", waitErr)
 		}
 		return "Sync complete", nil
